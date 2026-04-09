@@ -1,0 +1,132 @@
+{
+  "5198041379": {
+    "founder_name": "Meet",
+    "sent_at": "2026-04-09T11:42:42.413872+00:00",
+    "news_items": [
+      {
+        "number": 1,
+        "headline": "**No real-time search results from the last 24 hours (April 8-9, 2026) are available in the provided data, which consists solely of trend summaries, predictions, and curated reads for 2026 rather than specific breaking news stories.[1][2][3][4]**",
+        "sector": "",
+        "summary": ""
+      },
+      {
+        "number": 2,
+        "headline": "**Unable to provide the top 20 trending news stories with real headlines from today as instructed, since the sources lack any dated events or headlines from April 8-9, 2026.**",
+        "sector": "",
+        "summary": ""
+      },
+      {
+        "number": 3,
+        "headline": "**Key limitation:** All results discuss forward-looking trends (e.g., AI productivity, 10x founders, e-commerce growth) or monthly reads up to April 2026, with no timestamps or content tied to the precise 24-hour window requested.[1][2][3][4]",
+        "sector": "",
+        "summary": ""
+      }
+    ],
+    "business_ideas": [
+      {
+        "headline": "I only take 4-5 clients at a time and I always work for free first \u2014 here's exactly why that model makes us more money, not less",
+        "category": "Contrarian",
+        "why": "Creator clients are burned by overpromising agencies constantly \u2014 this angle proves trustworthiness before asking for anything",
+        "number": 4
+      },
+      {
+        "headline": "Every agency runs your YouTube growth on pure data. I use data plus gut instinct. Here's the difference it made for a creator who was stuck at the same subscriber count for 2 years",
+        "category": "Story",
+        "why": "Creators are data-fatigued and hungry for a partner who actually understands the human side of audience building, not just the metrics",
+        "number": 5
+      },
+      {
+        "headline": "The real reason most marketing agencies fail YouTube creators has nothing to do with strategy or budget",
+        "category": "Insight",
+        "why": "YouTube creators are a specific, underserved niche and calling out why generic agencies miss them positions this founder as the only one who truly gets their world",
+        "number": 6
+      }
+    ]
+  },
+  "8260098013": {
+    "founder_name": "Sneha",
+    "sent_at": "2026-04-03T11:52:26.183143+00:00",
+    "news_items": [
+      {
+        "headline": "AI Integration Becomes Vital for Startup Workflows",
+        "sector": "AI and technology",
+        "summary": "AI is streamlining routine startup tasks like market research and customer support, offering data-driven efficiency gains for lean founding teams.",
+        "number": 1
+      },
+      {
+        "headline": "Startups Shift to Diversified Funding via Community Campaigns",
+        "sector": "Startups and funding",
+        "summary": "Community-based funding models are giving founders more control and resilience in uncertain markets.",
+        "number": 2
+      },
+      {
+        "headline": "Relationship-Driven Growth and Mentorship Essential for Startup Scaling",
+        "sector": "Business and entrepreneurship",
+        "summary": "Collaborative networks and mentorship are proving more effective than solo hustle for founders looking to scale sustainably.",
+        "number": 3
+      },
+      {
+        "headline": "33 Entrepreneurship, Tech, and Startup Events Scheduled for April 2026",
+        "sector": "Startups and funding",
+        "summary": "A packed calendar of virtual and in-person founder events offers low-pressure ways to build meaningful connections this month.",
+        "number": 4
+      },
+      {
+        "headline": "Magnificent Seven Tech Stocks Pressure Startups to Diversify Revenue",
+        "sector": "Business and entrepreneurship",
+        "summary": "Volatility in big tech signals that focused, niche startups with diversified revenue are better positioned for long-term stability.",
+        "number": 5
+      },
+      {
+        "headline": "2026 Fastest-Growing Franchises Ranking Highlights Scalable Models",
+        "sector": "Business and entrepreneurship",
+        "summary": "Travel and hospitality brands appearing in scalable franchise rankings offer a useful lens for founders thinking about replicable, relaxation-focused experiences.",
+        "number": 6
+      }
+    ]
+  },
+  "1261228441": {
+    "founder_name": "Harsh",
+    "sent_at": "2026-04-09T11:42:16.785033+00:00",
+    "news_items": [
+      {
+        "number": 1,
+        "headline": "**No real-time search results from the last 24 hours (April 8-9, 2026) are available in the provided data, which consists solely of trend summaries, predictions, and curated reads for 2026 rather than specific breaking news stories.[1][2][3][4]**",
+        "sector": "",
+        "summary": ""
+      },
+      {
+        "number": 2,
+        "headline": "**Unable to provide the top 20 trending news stories with real headlines from today as instructed, since the sources lack any dated events or headlines from April 8-9, 2026.**",
+        "sector": "",
+        "summary": ""
+      },
+      {
+        "number": 3,
+        "headline": "**Key limitation:** All results discuss forward-looking trends (e.g., AI productivity, 10x founders, e-commerce growth) or monthly reads up to April 2026, with no timestamps or content tied to the precise 24-hour window requested.[1][2][3][4]",
+        "sector": "",
+        "summary": ""
+      }
+    ],
+    "business_ideas": [
+      {
+        "headline": "I started my company because I was broke and desperate \u2014 here's what that taught me about real motivation",
+        "category": "Story",
+        "why": "Raw founder vulnerability cuts through polished LinkedIn narratives and builds immediate trust with early-stage entrepreneurs",
+        "number": 4
+      },
+      {
+        "headline": "The moment I decided to go public with what I was building \u2014 and why it terrified me",
+        "category": "Story",
+        "why": "The tension between private struggle and public visibility resonates deeply with founders stepping into their first visible venture",
+        "number": 5
+      },
+      {
+        "headline": "What nobody tells you about building something legitimate from scratch when you have nothing to start with",
+        "category": "Lesson",
+        "why": "Audiences connect with founders who built from zero \u2014 scarcity origin stories are powerful proof points for resilience and credibility",
+        "number": 6
+      }
+    ]
+  }
+}
