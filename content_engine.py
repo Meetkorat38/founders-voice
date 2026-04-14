@@ -1,21 +1,17 @@
 """
-content_engine.py — Daily News Digest Engine
+content_engine.py — Daily News Digest Engine (Firecrawl Edition)
 
-What it does (and ONLY this):
-  1. Fetches last 24h trending news from the internet
-  2. Filters news relevant to each founder's sector/industry
-  3. Sends 4-6 news items to each founder via Telegram
-  4. Writes news_digest.json so bot.py knows what was sent
+Structure sent each morning:
+  1-3  🔥 WHAT'S VIRAL IN INDIA  — top 3 trending on Indian social media (24-72h)
+  4-8  🎯 IN YOUR WORLD          — 5 niche-specific news for this founder
+  9-10 💡 YOUR NEXT POST         — 2 profile-based content ideas (no URL)
 
-Run daily at 7AM:
-  Windows Task Scheduler: python content_engine.py
-  Railway / cron:         0 7 * * * python content_engine.py
-
-What it does NOT do:
-  - No scoring
-  - No post generation
-  - No draft writing
-  All of that is handled by bot.py + model.py after the founder responds
+How URLs work (two-pass system):
+  Pass 1 — Firecrawl /search returns title + description + markdown + URL per result.
+            Each result already carries its own verified URL.
+  Pass 2 — Claude reads the numbered results and picks the best ones, returning
+            {index, headline, summary}. URL is taken from items[index].url —
+            Claude never invents a URL.
 """
 
 import asyncio
@@ -27,250 +23,454 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from notion_client import Client as NotionClient
+from firecrawl import Firecrawl
 
 load_dotenv()
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-NOTION_TOKEN       = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+FIRECRAWL_API_KEY  = os.environ["FIRECRAWL_API_KEY"]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
+SUPABASE_URL       = os.environ["SUPABASE_URL"]
+SUPABASE_ANON_KEY  = os.environ["SUPABASE_ANON_KEY"]
 CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
-SEARCH_MODEL       = os.environ.get("SEARCH_MODEL", "perplexity/sonar")
 
-NEWS_DIGEST_FILE   = "news_digest.json"  # Shared with bot.py
+firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
 
-notion = NotionClient(auth=NOTION_TOKEN)
+NEWS_DIGEST_FILE   = "news_digest.json"
+
+# ── Supabase ──────────────────────────────────────────────────────────────────
+
+def _sb_headers() -> dict:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def get_all_founders() -> list[dict]:
+    print("[Supabase] Loading founders...")
+    try:
+        r = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/founders",
+            params={"select": "id,name,telegram_id,profile_text,profile_json,industry"},
+            headers=_sb_headers(),
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"[Supabase] Failed: {r.status_code} {r.text[:120]}")
+            return []
+        rows     = r.json()
+        founders = []
+        for row in rows:
+            name        = row.get("name")
+            telegram_id = row.get("telegram_id")
+            if not name or not telegram_id:
+                continue
+            founders.append({
+                "name":         name,
+                "telegram_id":  telegram_id,
+                "page_id":      row.get("id"),
+                "profile_text": row.get("profile_text", ""),
+                "profile_json": row.get("profile_json") or {},
+                "industry":     row.get("industry", ""),
+            })
+            print(f"  {name} — {telegram_id}")
+        print(f"[Supabase] {len(founders)} founders loaded")
+        return founders
+    except Exception as e:
+        print(f"[Supabase] Error: {e}")
+        return []
+
+async def log_digest_sent(telegram_id: str, founder_name: str, item_count: int):
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/bot_logs",
+                json={
+                    "telegram_id": str(telegram_id),
+                    "event_type":  "digest_sent",
+                    "message":     f"Digest sent to {founder_name} — {item_count} items",
+                    "payload":     {"item_count": item_count},
+                },
+                headers=_sb_headers(),
+            )
+    except Exception:
+        pass
+
+# ── Core AI calls ─────────────────────────────────────────────────────────────
+
+def _firecrawl_search(
+    query: str,
+    sources: list[str],
+    tbs: str,
+    limit: int = 10,
+    location: str | None = None,
+) -> list[dict]:
+    """
+    Pass 1: Firecrawl /search. Returns flat list of {title, description, url, markdown, source}.
+    Each result already carries a verified URL — no positional citation merge needed.
+    """
+    print(f"[Firecrawl] query={query[:80]!r} sources={sources} tbs={tbs} limit={limit}")
+    try:
+        resp = firecrawl.search(
+            query=query,
+            sources=sources,
+            tbs=tbs,
+            limit=limit,
+            location=location,
+            scrape_options={
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+                "parsers": [],
+                "proxy": "basic",
+            },
+        )
+    except Exception as e:
+        print(f"[Firecrawl] Exception: {e}")
+        return []
+
+    items: list[dict] = []
+    for src in sources:
+        bucket = getattr(resp, src, None)
+        if bucket is None and isinstance(resp, dict):
+            bucket = resp.get(src)
+        if not bucket:
+            continue
+        for r in bucket:
+            d = r if isinstance(r, dict) else getattr(r, "__dict__", {})
+            url = d.get("url") or ""
+            if not url:
+                continue
+            items.append({
+                "title":       d.get("title") or "",
+                "description": d.get("description") or d.get("snippet") or "",
+                "url":         url,
+                "markdown":    (d.get("markdown") or "")[:800],
+                "source":      src,
+            })
+
+    print(f"[Firecrawl] → {len(items)} items with URLs")
+    return items
 
 
-# ── AI call ───────────────────────────────────────────────────────────────────
+async def _claude_pick(
+    items: list[dict],
+    system_prompt: str,
+    max_items: int,
+    max_tokens: int = 1000,
+) -> list[dict]:
+    """
+    Pass 2: Claude reads numbered Firecrawl results and picks the best ones.
+    Returns [{headline, summary, source_url}] where source_url is taken from
+    items[index].url — Claude never invents a URL.
+    """
+    if not items:
+        return []
 
-async def call_ai(prompt: str, model: str = None, max_tokens: int = 2000) -> str:
-    async with httpx.AsyncClient(timeout=90) as client:
+    payload = "\n\n".join(
+        f"[{i}] TITLE: {it['title']}\n"
+        f"    DESC: {it['description']}\n"
+        f"    SNIPPET: {it['markdown'][:300]}"
+        for i, it in enumerate(items)
+    )
+
+    async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://founderbot.app",
-                "X-Title": "Founder News Engine",
+                "X-Title":      "Founder News Engine",
             },
             json={
-                "model": model or CLAUDE_MODEL,
+                "model":      CLAUDE_MODEL,
                 "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": payload},
+                ],
             },
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        content = r.json()["choices"][0]["message"]["content"].strip()
 
-
-# ── Load all founders from Notion ─────────────────────────────────────────────
-
-def get_all_founders() -> list[dict]:
-    print("[Notion] Loading founders...")
-    pages = notion.databases.query(database_id=NOTION_DATABASE_ID).get("results", [])
-    founders = []
-
-    for page in pages:
-        name_prop   = page["properties"].get("Name", {}).get("title", [])
-        name        = name_prop[0]["text"]["content"] if name_prop else None
-        if not name:
-            continue
-
-        tg_prop     = page["properties"].get("TelegramID", {}).get("rich_text", [])
-        telegram_id = tg_prop[0]["text"]["content"] if tg_prop else None
-
-        # Read profile to extract sector/industry context
-        page_id = page["id"]
-        blocks  = notion.blocks.children.list(block_id=page_id).get("results", [])
-        lines   = []
-        for b in blocks:
-            bt = b.get("type", "")
-            if bt in ("paragraph", "heading_2", "heading_3"):
-                for r in b[bt].get("rich_text", []):
-                    t = r.get("text", {}).get("content", "").strip()
-                    if t and len(t) > 10:
-                        lines.append(t)
-
-        profile_text = "\n".join(lines[:40])  # First 40 lines = enough context
-
-        founders.append({
-            "name":         name,
-            "telegram_id":  telegram_id,
-            "page_id":      page_id,
-            "profile_text": profile_text,
-        })
-        status = "✓" if telegram_id else "no TelegramID"
-        print(f"  {name} — {status}")
-
-    return founders
-
-
-# ── Fetch trending news ───────────────────────────────────────────────────────
-
-async def fetch_trending_news() -> str:
-    """Get real 24h trending news using web search model."""
-    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    print(f"[News] Fetching trending news for {today}...")
-
-    prompt = (
-        f"Today is {today}. Search the internet and find the top 20 trending news stories "
-        f"from the LAST 24 HOURS across these sectors:\n"
-        f"- Business and entrepreneurship\n"
-        f"- AI and technology\n"
-        f"- Marketing and growth\n"
-        f"- Startups and funding\n"
-        f"- Indian business ecosystem\n"
-        f"- Leadership and management\n"
-        f"- Social media and content\n"
-        f"- Finance and economy\n\n"
-        f"For each story give:\n"
-        f"- Headline (clear and specific)\n"
-        f"- Sector (which category above)\n"
-        f"- 1-sentence summary\n\n"
-        f"Use REAL headlines from today. Be specific — not generic topics."
-    )
-
-    try:
-        news = await call_ai(prompt, model=SEARCH_MODEL, max_tokens=3000)
-        print(f"[News] Got {len(news)} chars from {SEARCH_MODEL}")
-        return news
-    except Exception as e:
-        print(f"[News] Search model failed ({e}) — using Claude fallback")
-        fallback = (
-            f"Today is {today}. List 20 specific trending news stories that "
-            f"entrepreneurs and founders are discussing this week. Cover: AI, startups, "
-            f"marketing, Indian business, leadership, social media. Be as current and "
-            f"specific as possible with real headlines."
-        )
-        return await call_ai(fallback, max_tokens=2000)
-
-
-# ── Filter news for a specific founder ───────────────────────────────────────
-
-async def filter_news_for_founder(founder: dict, all_news: str) -> list[dict]:
-    """
-    From the full news list, select 5-6 most relevant items for this founder
-    based on their profile and sector.
-    Returns a list of {number, headline, sector, summary} dicts.
-    """
-    name    = founder["name"]
-    profile = founder["profile_text"]
-
-    print(f"[Filter] Selecting news for {name}...")
-
-    prompt = (
-        f"You are selecting news for a specific founder.\n\n"
-        f"FOUNDER PROFILE:\n{profile[:1500]}\n\n"
-        f"ALL TODAY'S NEWS:\n{all_news}\n\n"
-        f"Select the 5 to 6 news items that are MOST relevant to this founder "
-        f"based on their industry, expertise, audience, and what they talk about.\n\n"
-        f"Also include 1-2 wildcard items — news from adjacent sectors that a "
-        f"smart founder in their space should know about.\n\n"
-        f"Return ONLY a JSON array, no markdown, no backticks:\n"
-        f'[{{"headline": "...", "sector": "...", "summary": "one sentence"}}]'
-    )
-
-    result = await call_ai(prompt, max_tokens=1000)
-    match  = re.search(r'\[.*\]', result, re.DOTALL)
+    match = re.search(r'\[.*\]', content, re.DOTALL)
     if not match:
-        # Fallback: return raw news split into items
-        print(f"[Filter] JSON parse failed — using raw news")
+        print(f"[Claude] No JSON array found in response")
         return []
+    try:
+        picks = json.loads(match.group())
+    except json.JSONDecodeError as e:
+        print(f"[Claude] JSON parse error: {e}")
+        return []
+
+    out = []
+    seen_urls = set()
+    for p in picks[:max_items]:
+        idx = p.get("index")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(items):
+            continue
+        url = items[idx]["url"]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        out.append({
+            "headline":   (p.get("headline") or items[idx]["title"]).strip(),
+            "summary":    (p.get("summary") or "").strip(),
+            "source_url": url,
+        })
+    return out
+
+
+def _number_items(items: list[dict], start_num: int, item_type: str) -> list[dict]:
+    return [
+        {
+            "number":     start_num + i,
+            "headline":   it["headline"],
+            "summary":    it["summary"],
+            "source_url": it["source_url"],
+            "type":       item_type,
+        }
+        for i, it in enumerate(items)
+    ]
+
+# ── Step 1: Fetch 3 Indian viral stories ─────────────────────────────────────
+
+async def fetch_indian_viral_news() -> list[dict]:
+    """
+    Two-pass fetch for top 3 stories viral across India (24-72h).
+    """
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    print(f"\n[Viral] Fetching Indian viral news — {today}")
+
+    # Pass 1: cast a WIDE net — run several broad queries and pool results.
+    # We don't bias to any specific category (cricket/bollywood/etc). Claude filters.
+    queries = [
+        "top trending news India today",
+        "what Indians are talking about today social media",
+        "most discussed story India past 24 hours",
+        "India trending twitter X today",
+    ]
+    raw_items: list[dict] = []
+    seen_urls: set[str] = set()
+    for q in queries:
+        for item in _firecrawl_search(
+            query=q,
+            sources=["news", "web"],
+            tbs="qdr:d",
+            limit=8,
+            location="in",
+        ):
+            if item["url"] in seen_urls:
+                continue
+            seen_urls.add(item["url"])
+            raw_items.append(item)
+
+    if not raw_items:
+        print(f"[Viral] Empty Firecrawl result")
+        return []
+    print(f"[Viral] Pooled {len(raw_items)} unique results across {len(queries)} queries")
+
+    # Pass 2: Claude picks the 3 topics actually driving engagement right now.
+    # No category hints — let the data speak.
+    system_prompt = (
+        f"Today is {today}. You are given numbered web/news search results from India "
+        "covering the past 24-48 hours.\n\n"
+        "Your job: identify the TOP 3 TOPICS currently driving the MOST conversation "
+        "and engagement across Indian social media (Twitter/X India, Instagram, YouTube, "
+        "WhatsApp) right now.\n\n"
+        "A topic qualifies only if ALL are true:\n"
+        "1. It broke or peaked in the last 24-48 hours\n"
+        "2. Ordinary Indians (not just one industry) are reacting to it\n"
+        "3. Posting an opinion about it would get real engagement today\n\n"
+        "Do NOT assume categories. The 3 winners could be anything — policy, sports, "
+        "tech layoffs, a celebrity, a startup scandal, a weather event, an economic shift, "
+        "a viral video, whatever is actually dominating feeds. Pick what the DATA shows, "
+        "not what you'd expect.\n\n"
+        "Reject: evergreen explainers, listicles, pure promo, week-old stories, niche "
+        "industry news that only insiders discuss.\n\n"
+        "If two results cover the same topic, pick the one with the strongest source and "
+        "merge context — don't return duplicates.\n\n"
+        "Return ONLY a JSON array (no markdown, no backticks):\n"
+        '[{"index": <int from input>, '
+        '"headline": "the specific topic as a headline", '
+        '"summary": "two sentences — what happened + why India is reacting / what the debate is"}]'
+    )
 
     try:
-        items = json.loads(match.group())
-        # Number them
-        for i, item in enumerate(items, 1):
-            item["number"] = i
-        print(f"[Filter] Selected {len(items)} items for {name}")
-        return items[:6]
-    except json.JSONDecodeError:
+        picks = await _claude_pick(raw_items, system_prompt, max_items=3, max_tokens=700)
+    except Exception as e:
+        print(f"[Viral] Claude picking failed: {e}")
         return []
 
+    items = _number_items(picks, start_num=1, item_type="viral")
+    print(f"[Viral] Done — {len(items)} items, {len([i for i in items if i['source_url']])} with URLs")
+    return items
 
-# ── Generate business content ideas ──────────────────────────────────────────
+# ── Step 2: Fetch 5 niche news items for founder ─────────────────────────────
 
-async def generate_business_ideas(founder: dict, start_num: int, num: int = 3) -> list[dict]:
+async def fetch_niche_news(founder: dict, start_num: int) -> list[dict]:
     """
-    Generate content ideas based on the founder's business and profile.
-    Returns list of {number, headline, category, why} dicts.
+    Two-pass fetch for 5 industry-specific news items for this founder.
+    """
+    name     = founder["name"]
+    profile  = founder["profile_text"][:1200]
+    industry = founder.get("industry", "") or "business"
+    today    = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    print(f"\n[Niche] Fetching for {name} ({industry})")
+
+    # Pass 1: Firecrawl, biased to industry + India + last week
+    query = f"{industry} news India founders trends report this week"
+    raw_items = _firecrawl_search(
+        query=query,
+        sources=["news", "web"],
+        tbs="qdr:w",
+        limit=15,
+        location="in",
+    )
+    if not raw_items:
+        print(f"[Niche] Empty Firecrawl result for {name}")
+        return []
+
+    # Pass 2: Claude picks the 5 most relevant for THIS founder
+    system_prompt = (
+        f"Today is {today}.\n\n"
+        f"FOUNDER CONTEXT:\n{profile}\n\n"
+        "You are given numbered web/news search results. Pick the 5 items most relevant "
+        "to THIS founder's industry, audience, and expertise. Prefer a mix of:\n"
+        "- Breaking news or new developments in their sector\n"
+        "- Industry data, reports, or research published recently\n"
+        "- Competitor moves or market shifts they should know\n"
+        "- Platform changes relevant to their work\n"
+        "- Trends their target audience is actively discussing\n\n"
+        "Skip generic / promotional / evergreen results.\n\n"
+        "Return ONLY a JSON array (no markdown, no backticks, nothing else):\n"
+        '[{"index": <int from input>, "headline": "specific real headline", '
+        '"summary": "one sentence why this matters for this founder"}]'
+    )
+
+    try:
+        picks = await _claude_pick(raw_items, system_prompt, max_items=5, max_tokens=900)
+    except Exception as e:
+        print(f"[Niche] Claude picking failed for {name}: {e}")
+        return []
+
+    items = _number_items(picks, start_num=start_num, item_type="niche")
+    print(f"[Niche] Done — {len(items)} items, {len([i for i in items if i['source_url']])} with URLs")
+    return items
+
+# ── Step 3: Generate 2 content ideas (Claude only, no search needed) ─────────
+
+async def generate_content_ideas(founder: dict, start_num: int) -> list[dict]:
+    """
+    Claude generates 2 strategic LinkedIn post ideas based on founder's profile.
+    No URLs needed — these are generated ideas, not news items.
     """
     name    = founder["name"]
-    profile = founder["profile_text"]
-
-    print(f"[Ideas] Generating {num} business ideas for {name}...")
+    profile = founder["profile_text"][:2000]
+    print(f"\n[Ideas] Generating for {name}")
 
     prompt = (
         f"You are a LinkedIn content strategist.\n\n"
-        f"FOUNDER PROFILE:\n{profile[:2000]}\n\n"
-        f"Generate {num} specific LinkedIn post IDEAS for this founder based on their "
-        f"business, expertise, and what their audience needs right now.\n\n"
-        f"Each idea should:\n"
-        f"- Be specific to their business/industry (not generic)\n"
-        f"- Be something they have unique authority to write about\n"
-        f"- Have a compelling angle that resonates with their audience\n\n"
+        f"FOUNDER PROFILE:\n{profile}\n\n"
+        f"Generate 2 specific, high-quality LinkedIn post IDEAS for this founder.\n\n"
+        f"Each idea must:\n"
+        f"- Be specific to their business and personal story — not generic\n"
+        f"- Be something only THIS founder has the authority and experience to write\n"
+        f"- Have a compelling hook that stops their specific audience while scrolling\n"
+        f"- Draw from a real tension, insight, or lesson in their work\n\n"
         f"Return ONLY a JSON array, no markdown, no backticks:\n"
-        f'[{{"headline": "Compelling content prompt as a statement or question", '
-        f'"category": "Lesson/Story/Insight/Contrarian/How-To", '
-        f'"why": "one line — why this resonates for their audience now"}}]'
+        f'[{{"headline": "post idea as a bold statement or question", '
+        f'"category": "Story/Insight/Contrarian/Lesson/How-To", '
+        f'"why": "one line — why this resonates for their audience"}}]'
     )
 
-    result = await call_ai(prompt, max_tokens=800)
-    match  = re.search(r'\[.*\]', result, re.DOTALL)
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://founderbot.app",
+                "X-Title":      "Founder News Engine",
+            },
+            json={
+                "model":      CLAUDE_MODEL,
+                "max_tokens": 600,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+        )
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"].strip()
+
+    match = re.search(r'\[.*\]', content, re.DOTALL)
     if not match:
-        print(f"[Ideas] JSON parse failed for {name}")
+        print(f"[Ideas] No JSON found for {name}")
         return []
 
     try:
         items = json.loads(match.group())
-        for i, item in enumerate(items[:num], start_num):
-            item["number"] = i
-        print(f"[Ideas] Generated {len(items[:num])} ideas for {name}")
-        return items[:num]
     except json.JSONDecodeError:
+        print(f"[Ideas] JSON parse error for {name}")
         return []
 
+    result = []
+    for item in items[:2]:
+        result.append({
+            "number":   start_num + len(result),
+            "headline": item.get("headline", "").strip(),
+            "category": item.get("category", ""),
+            "why":      item.get("why", ""),
+            # No source_url — these are generated ideas
+        })
 
-# ── Format digest message ─────────────────────────────────────────────────────
+    print(f"[Ideas] Done — {len(result)} ideas for {name}")
+    return result
 
-def format_digest(founder_name: str, news_items: list[dict],
-                  business_ideas: list[dict]) -> str:
-    today     = datetime.now(timezone.utc).strftime("%A, %B %d")
-    total     = len(news_items) + len(business_ideas)
-    lines     = [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Good morning {founder_name}!",
-        f"{today}",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"",
+# ── Format digest ─────────────────────────────────────────────────────────────
+
+def format_digest(founder_name: str, viral_items: list[dict],
+                  niche_items: list[dict], ideas: list[dict]) -> str:
+    today = datetime.now(timezone.utc).strftime("%A, %B %d")
+    total = len(viral_items) + len(niche_items) + len(ideas)
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"Good morning {founder_name}! ☀️",
+        today,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
     ]
 
-    if news_items:
-        lines.append("📰 TRENDING TODAY\n")
-        for item in news_items:
-            n        = item.get("number", "")
-            headline = item.get("headline", "")
-            sector   = item.get("sector", "")
-            summary  = item.get("summary", "")
-            lines.append(f"{n}. {headline}")
-            tag = f"[{sector}] " if sector else ""
-            if summary:
-                lines.append(f"   {tag}{summary}")
+    if viral_items:
+        lines.append("🔥 WHAT'S VIRAL IN INDIA\n")
+        for item in viral_items:
+            lines.append(f"{item['number']}. {item['headline']}")
+            if item.get("summary"):
+                lines.append(f"   → {item['summary']}")
+            if item.get("source_url"):
+                lines.append(f"   🔗 {item['source_url']}")
             lines.append("")
 
-    if business_ideas:
+    if niche_items:
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("💡 YOUR BUSINESS IDEAS\n")
-        for item in business_ideas:
-            n        = item.get("number", "")
-            headline = item.get("headline", "")
-            category = item.get("category", "")
-            why      = item.get("why", "")
-            lines.append(f"{n}. {headline}")
-            tag = f"[{category}] " if category else ""
-            if why:
-                lines.append(f"   {tag}{why}")
+        lines.append("🎯 IN YOUR WORLD\n")
+        for item in niche_items:
+            lines.append(f"{item['number']}. {item['headline']}")
+            if item.get("summary"):
+                lines.append(f"   → {item['summary']}")
+            if item.get("source_url"):
+                lines.append(f"   🔗 {item['source_url']}")
+            lines.append("")
+
+    if ideas:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 YOUR NEXT POST\n")
+        for item in ideas:
+            tag = f"[{item['category']}] " if item.get("category") else ""
+            lines.append(f"{item['number']}. {item['headline']}")
+            if item.get("why"):
+                lines.append(f"   {tag}→ {item['why']}")
             lines.append("")
 
     lines += [
@@ -281,8 +481,7 @@ def format_digest(founder_name: str, news_items: list[dict],
     ]
     return "\n".join(lines)
 
-
-# ── Send Telegram message ─────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
 async def send_telegram(chat_id: str, text: str):
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -296,14 +495,14 @@ async def send_telegram(chat_id: str, text: str):
             print(f"[Telegram] → {chat_id}: {'OK' if ok else r.text[:80]}")
             await asyncio.sleep(0.3)
 
-
-# ── Write news_digest.json for bot.py ────────────────────────────────────────
+# ── Write news_digest.json ────────────────────────────────────────────────────
 
 def write_news_digest(telegram_id: str, founder_name: str,
-                      news_items: list[dict], business_ideas: list[dict] = None):
+                      news_items: list[dict], business_ideas: list[dict]):
     """
-    Write sent items to news_digest.json.
-    bot.py reads this when a founder replies with a number.
+    Writes flat list of news_items (viral + niche) + business_ideas.
+    bot.py reads this file to know what was sent this morning.
+    Schema matches what bot.py expects: news_items[] + business_ideas[].
     """
     try:
         existing = {}
@@ -316,72 +515,74 @@ def write_news_digest(telegram_id: str, founder_name: str,
     existing[str(telegram_id)] = {
         "founder_name":   founder_name,
         "sent_at":        datetime.now(timezone.utc).isoformat(),
-        "news_items":     news_items,                      # {number, headline, sector, summary}
-        "business_ideas": business_ideas or [],            # {number, headline, category, why}
+        "news_items":     news_items,
+        "business_ideas": business_ideas,
     }
 
     with open(NEWS_DIGEST_FILE, "w") as f:
         json.dump(existing, f, indent=2)
 
-    print(f"[Digest] Written news_digest.json for {founder_name} "
-          f"({len(news_items)} news + {len(business_ideas or [])} ideas)")
-
+    viral_count = len([n for n in news_items if n.get("type") == "viral"])
+    niche_count = len([n for n in news_items if n.get("type") == "niche"])
+    url_count   = len([n for n in news_items if n.get("source_url")])
+    print(f"[Digest] Written for {founder_name}: "
+          f"{viral_count} viral + {niche_count} niche ({url_count} with URLs) + {len(business_ideas)} ideas")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def run():
-    print("=" * 50)
-    print("FOUNDER NEWS DIGEST ENGINE")
-    print(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    print("=" * 50)
+    print("=" * 52)
+    print("  FOUNDER DIGEST ENGINE — FIRECRAWL EDITION")
+    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 52)
 
     founders = get_all_founders()
     if not founders:
-        print("No founders found in Notion DB.")
+        print("No founders found in Supabase.")
         return
 
-    # Fetch all news once — filter per founder
-    all_news = await fetch_trending_news()
-    print(f"\n[News] Fetched. Sample:\n{all_news[:300]}...\n")
+    # Fetch Indian viral news once — same 3 items for ALL founders
+    viral_items = await fetch_indian_viral_news()
+    if viral_items:
+        print(f"\n[Viral] Pool ready: {len(viral_items)} items")
+    else:
+        print("\n[Viral] No viral items — section will be skipped for all founders")
 
     for founder in founders:
         name = founder["name"]
-        print(f"\n{'─' * 40}")
-        print(f"Processing: {name}")
-        print(f"{'─' * 40}")
+        print(f"\n{'─' * 48}")
+        print(f"  Processing: {name}")
+        print(f"{'─' * 48}")
 
         if not founder["telegram_id"]:
-            print(f"[Skip] No TelegramID for {name}")
+            print(f"[Skip] No telegram_id for {name}")
             continue
 
-        # Filter trending news for this founder's sector
-        news_items = await filter_news_for_founder(founder, all_news)
+        # Niche news numbered after viral (e.g. starts at 4 if 3 viral items)
+        niche_start = len(viral_items) + 1
+        niche_items = await fetch_niche_news(founder, start_num=niche_start)
 
-        if not news_items:
-            # Fallback: raw news items numbered manually
-            lines    = all_news.strip().split("\n")
-            numbered = [l for l in lines if l.strip() and len(l) > 20][:5]
-            news_items = [
-                {"number": i+1, "headline": l.strip(), "sector": "", "summary": ""}
-                for i, l in enumerate(numbered)
-            ]
-
-        # Generate business content ideas (numbered after news)
-        start_biz  = len(news_items) + 1
-        biz_ideas  = await generate_business_ideas(founder, start_num=start_biz, num=3)
+        # Ideas numbered after viral + niche
+        ideas_start = len(viral_items) + len(niche_items) + 1
+        ideas       = await generate_content_ideas(founder, start_num=ideas_start)
 
         # Format and send
-        digest_msg = format_digest(name, news_items, biz_ideas)
+        digest_msg = format_digest(name, viral_items, niche_items, ideas)
         await send_telegram(founder["telegram_id"], digest_msg)
 
         # Write to news_digest.json for bot.py
-        write_news_digest(founder["telegram_id"], name, news_items, biz_ideas)
+        all_news_items = viral_items + niche_items
+        write_news_digest(founder["telegram_id"], name, all_news_items, ideas)
+
+        asyncio.create_task(log_digest_sent(
+            founder["telegram_id"], name, len(all_news_items) + len(ideas)
+        ))
 
         await asyncio.sleep(2)
 
-    print(f"\n{'=' * 50}")
-    print("DIGEST SENT TO ALL FOUNDERS")
-    print(f"{'=' * 50}")
+    print(f"\n{'=' * 52}")
+    print("  DIGEST SENT TO ALL FOUNDERS")
+    print(f"{'=' * 52}")
 
 
 if __name__ == "__main__":

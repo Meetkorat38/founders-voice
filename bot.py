@@ -1,15 +1,15 @@
 """
-Founder Voice Bot — FINAL (two-file version)
-model.py is merged in here — no separate file needed.
+Founder Voice Bot — Supabase Edition
+Notion removed. All profile reads/writes go to Supabase REST API.
 
-Flow:
-  1. content_engine.py sends 4-6 news items at 7AM
-  2. Founder replies with a number (1-6) to pick a topic
-  3. Founder sends voice note or text with their angle/idea
-  4. Bot generates LinkedIn post using their Notion profile + their idea
-  5. APPROVE / EDIT / NEXT / SHORTER / LONGER
-
-Run: python bot.py
+Changes from previous version:
+  - Removed: notion_client, NOTION_TOKEN, NOTION_DATABASE_ID
+  - save_profile_to_notion() → save_profile_to_supabase()
+  - get_founder_profile_from_notion() → get_founder_profile_from_supabase()
+  - save_approved_post_to_notion() → removed (web app handles post storage now)
+  - auto_save_telegram_id() → removed (handled in save_profile_to_supabase)
+  - trigger_heygen_pipeline() → now posts to Supabase webhook edge function
+  - Everything else (interview, post gen, news selection, draft editing) unchanged
 """
 
 import asyncio
@@ -23,8 +23,8 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from notion_client import Client as NotionClient
 from telegram import Update, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes,
@@ -36,21 +36,21 @@ load_dotenv()
 
 TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY  = os.environ["OPENROUTER_API_KEY"]
-NOTION_TOKEN        = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID  = os.environ["NOTION_DATABASE_ID"]
 CLAUDE_MODEL        = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-# n8n webhook — fires after founder approves a post → triggers HeyGen video pipeline
-N8N_HEYGEN_WEBHOOK_URL = os.environ.get("N8N_HEYGEN_WEBHOOK_URL", "")
+# Supabase — replaces Notion
+SUPABASE_URL      = os.environ["SUPABASE_URL"]
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 
-# Optional: GIF/animation shown on /start to teach users how to send voice notes
-# Set WELCOME_GIF in .env to a local file path OR a public URL of the GIF
-WELCOME_GIF = os.environ.get("WELCOME_GIF", "")
+# Webhook secret — must match what Supabase edge function expects
+# WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 
-NEWS_DIGEST_FILE = "news_digest.json"    # Written by content_engine.py
-PENDING_FILE     = "pending_drafts.json" # Written by this bot
+ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "")  # your Lovable app URL
+
+NEWS_DIGEST_FILE = "news_digest.json"
+PENDING_FILE     = "pending_drafts.json"
 
 USE_VOICE = False
 el        = None
@@ -64,13 +64,168 @@ if ELEVENLABS_API_KEY:
     except Exception as e:
         print(f"ElevenLabs failed ({e}) — text only")
 
-notion = NotionClient(auth=NOTION_TOKEN)
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+
+def _sb_headers() -> dict:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def _webhook_headers() -> dict:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+async def save_profile_to_supabase(name: str, profile: dict, transcript: list, uid: int) -> str:
+    """
+    Upsert founder profile into Supabase founders table.
+    Calls the save-founder-profile edge function.
+    Returns the founder ID or a status string.
+    """
+    arch     = profile.get("archetype_blend", {})
+    business = profile.get("business", {})
+
+    arch_line = (
+        f"{arch.get('primary', '—')} ({int(float(arch.get('primary_weight', 0)) * 100)}%)"
+        f" + {arch.get('secondary', '—')} ({int(float(arch.get('secondary_weight', 0)) * 100)}%)"
+    )
+
+    # Build plain text profile for Claude prompts (same format as before)
+    dims     = profile.get("dimensions", {})
+    tov      = profile.get("tov", {})
+    dims_text = "\n".join(f"  {k.replace('_', ' ').title()}: {v}/100" for k, v in dims.items())
+    tov_text  = (
+        f"Hook: {tov.get('hook_style', '—')}\n"
+        f"CTA: {tov.get('cta_style', '—')}\n"
+        f"Sentence length: {tov.get('sentence_length', '—')}\n"
+        f"Vocabulary: {tov.get('vocabulary', '—')}\n"
+        f"Topics: {', '.join(tov.get('topics', []))}"
+    )
+    biz_text = (
+        f"Company: {business.get('company_name', '—')}\n"
+        f"What they do: {business.get('what_they_do', '—')}\n"
+        f"Industry: {business.get('industry', '—')}\n"
+        f"Target audience: {business.get('target_audience', '—')}\n"
+        f"Unique angle: {business.get('unique_angle', '—')}"
+    )
+    profile_text = f"Business Information\n{biz_text}\n\nArchetype: {arch_line}\n\nPersonality Dimensions\n{dims_text}\n\nTone of Voice\n{tov_text}"
+
+    payload = {
+        "telegram_id":    str(uid),
+        "name":           name,
+        "profile_json":   profile,
+        "profile_text":   profile_text,
+        "archetype":      arch_line,
+        "industry":       business.get("industry", ""),
+        "target_audience": business.get("target_audience", ""),
+        "unique_angle":   business.get("unique_angle", ""),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/functions/v1/save-founder-profile",
+                json=payload,
+                headers=_webhook_headers(),
+            )
+        if r.status_code in (200, 201):
+            data = r.json()
+            founder_id = data.get("founder_id", "")
+            print(f"[Supabase] Profile saved for {name} — id: {founder_id}")
+            return founder_id
+        else:
+            print(f"[Supabase] Profile save failed: {r.status_code} {r.text[:120]}")
+            return ""
+    except Exception as e:
+        print(f"[Supabase] Profile save error: {e}")
+        return ""
+
+
+def get_founder_profile_from_supabase(uid: int) -> dict:
+    """
+    Read founder profile from Supabase by telegram_id.
+    Returns { name, page_id, profile_text, tov_json }
+    Synchronous wrapper — uses httpx sync client so it can be called from sync context.
+    """
+    try:
+        import httpx as _httpx
+        r = _httpx.get(
+            f"{SUPABASE_URL}/rest/v1/founders",
+            params={"telegram_id": f"eq.{uid}", "select": "*", "limit": "1"},
+            headers=_sb_headers(),
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(f"[Supabase] Profile read failed: {r.status_code}")
+            return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+
+        rows = r.json()
+        if not rows:
+            return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+
+        row = rows[0]
+        profile_json = row.get("profile_json") or {}
+        tov_json     = profile_json.get("tov", {})
+
+        return {
+            "name":         row.get("name", "Founder"),
+            "page_id":      row.get("id"),          # uuid, used as reference
+            "profile_text": row.get("profile_text", ""),
+            "tov_json":     tov_json,
+        }
+    except Exception as e:
+        print(f"[Supabase] Profile read error: {e}")
+        return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+
+
+async def trigger_video_pipeline(payload: dict):
+    """
+    POST approved post to Supabase webhook edge function.
+    The edge function saves the post and auto-triggers video generation.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/functions/v1/webhook-post-approved",
+                json=payload,
+                headers=_webhook_headers(),
+            )
+        if r.status_code in (200, 201, 202):
+            print(f"[Webhook] Post sent ✓ for {payload.get('founder_name')}")
+        else:
+            print(f"[Webhook] Failed: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"[Webhook] Error: {e}")
+
+
+async def log_to_supabase(telegram_id: str, event_type: str, message: str, payload: dict = None):
+    """Fire-and-forget log to bot_logs table."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/bot_logs",
+                json={
+                    "telegram_id": str(telegram_id),
+                    "event_type":  event_type,
+                    "message":     message,
+                    "payload":     payload or {},
+                },
+                headers=_sb_headers(),
+            )
+    except Exception:
+        pass  # logs are best-effort, never block main flow
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-sessions:        dict[int, dict] = {}  # interview sessions
-pending_drafts:  dict[int, dict] = {}  # drafts waiting for APPROVE/EDIT
-news_selections: dict[int, dict] = {}  # selected news topic, waiting for idea
+sessions:        dict[int, dict] = {}
+pending_drafts:  dict[int, dict] = {}
+news_selections: dict[int, dict] = {}
 
 # ── Telegram command menu ─────────────────────────────────────────────────────
 
@@ -136,7 +291,6 @@ def save_pending():
 
 
 def get_draft(uid: int) -> dict | None:
-    load_pending()
     return pending_drafts.get(uid)
 
 
@@ -146,28 +300,31 @@ def clear_draft(uid: int):
 
 
 def get_today_digest(uid: int) -> dict:
-    """Read full digest (trending news + business ideas) sent this morning."""
     if not Path(NEWS_DIGEST_FILE).exists():
         return {"news_items": [], "business_ideas": []}
     try:
         with open(NEWS_DIGEST_FILE, "r") as f:
             data = json.load(f)
         entry = data.get(str(uid), {})
+        # Merge viral (1-3) + niche (4-8) into a single flat list
+        # so all existing callers (handle_news_selection, cmd_draft, etc.) work unchanged
+        viral    = entry.get("viral_items", [])
+        niche    = entry.get("news_items", [])
+        combined = viral + niche
         return {
-            "news_items":     entry.get("news_items", []),
+            "news_items":     combined,
             "business_ideas": entry.get("business_ideas", []),
         }
-    except Exception:
+    except Exception as e:
+        print(f"[Digest] Failed to parse {NEWS_DIGEST_FILE}: {e}")
         return {"news_items": [], "business_ideas": []}
 
 
 def get_today_news(uid: int) -> list[dict]:
-    """Backwards-compat: return news_items only."""
     return get_today_digest(uid)["news_items"]
 
 
 def draft_keyboard() -> InlineKeyboardMarkup:
-    """Inline action buttons shown below every generated draft."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Approve",  callback_data="APPROVE"),
@@ -200,7 +357,6 @@ async def tts(text: str) -> bytes | None:
         err = str(e)
         if "voice_not_found" in err or "404" in err:
             print(f"[TTS] Voice ID not found — disabling voice.")
-            print(f"[TTS] Fix in .env: ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM")
             USE_VOICE = False
         else:
             print(f"[TTS] {err[:100]}")
@@ -217,11 +373,6 @@ async def stt(ogg: bytes) -> str | None:
     except Exception as e:
         print(f"[STT] {e}")
         return None
-
-
-async def send_reply(update: Update, text: str):
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        await update.message.reply_text(chunk)
 
 # ── Claude API call ───────────────────────────────────────────────────────────
 
@@ -240,199 +391,9 @@ async def call_claude(messages: list, system: str = None, max_tokens: int = 1500
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
-# ── Notion helpers ────────────────────────────────────────────────────────────
-
-def _txt(c: str) -> dict:
-    return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"type": "text", "text": {"content": c[:1900]}}]}}
-
-def _h2(c: str) -> dict:
-    return {"object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
-
-def _h3(c: str) -> dict:
-    return {"object": "block", "type": "heading_3",
-            "heading_3": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
-
-def _div() -> dict:
-    return {"object": "block", "type": "divider", "divider": {}}
-
-
-def auto_save_telegram_id(name: str, uid: int):
-    """Find founder by name in Notion, save TelegramID if missing."""
-    try:
-        pages = notion.databases.query(database_id=NOTION_DATABASE_ID).get("results", [])
-        for page in pages:
-            title = page["properties"].get("Name", {}).get("title", [])
-            pname = title[0]["text"]["content"] if title else ""
-            if pname.lower() == name.lower():
-                tg = page["properties"].get("TelegramID", {}).get("rich_text", [])
-                if tg:
-                    return
-                notion.pages.update(
-                    page_id=page["id"],
-                    properties={"TelegramID": {"rich_text": [{"text": {"content": str(uid)}}]}}
-                )
-                print(f"[Notion] TelegramID {uid} saved for {name}")
-                return
-    except Exception as e:
-        print(f"[Notion] TelegramID save error: {e}")
-
-
-def get_founder_profile_from_notion(uid: int) -> dict:
-    """
-    Read full founder profile from Notion by TelegramID.
-    Returns { name, page_id, profile_text, tov_json }
-    """
-    try:
-        pages = notion.databases.query(database_id=NOTION_DATABASE_ID).get("results", [])
-        for page in pages:
-            tg = page["properties"].get("TelegramID", {}).get("rich_text", [])
-            if not tg or tg[0]["text"]["content"] != str(uid):
-                continue
-
-            title = page["properties"].get("Name", {}).get("title", [])
-            name  = title[0]["text"]["content"] if title else "Founder"
-
-            blocks = notion.blocks.children.list(block_id=page["id"]).get("results", [])
-            lines, tov_json = [], {}
-
-            for b in blocks:
-                bt = b.get("type", "")
-                if bt not in ("paragraph", "heading_2", "heading_3", "quote"):
-                    continue
-                for r in b[bt].get("rich_text", []):
-                    text = r.get("text", {}).get("content", "").strip()
-                    if not text:
-                        continue
-                    lines.append(text)
-                    # Extract TOV JSON if stored
-                    if text.startswith('{"avg_sentence') or text.startswith('{"uses_emojis'):
-                        try:
-                            tov_json = json.loads(text)
-                        except Exception:
-                            pass
-
-            return {
-                "name":         name,
-                "page_id":      page["id"],
-                "profile_text": "\n".join(lines),
-                "tov_json":     tov_json,
-            }
-    except Exception as e:
-        print(f"[Notion] Profile read error: {e}")
-
-    return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
-
-
-def save_profile_to_notion(name: str, profile: dict, transcript: list, uid: int) -> str:
-    dims     = profile.get("dimensions", {})
-    arch     = profile.get("archetype_blend", {})
-    tov      = profile.get("tov", {})
-    business = profile.get("business", {})
-
-    arch_line = (
-        f"{arch.get('primary','—')} ({int(float(arch.get('primary_weight',0))*100)}%) + "
-        f"{arch.get('secondary','—')} ({int(float(arch.get('secondary_weight',0))*100)}%)"
-    )
-    dims_text = "\n".join(f"  {k.replace('_',' ').title()}: {v}/100" for k, v in dims.items())
-    tov_text  = (
-        f"Hook: {tov.get('hook_style','—')}\n"
-        f"CTA: {tov.get('cta_style','—')}\n"
-        f"Sentence length: {tov.get('sentence_length','—')}\n"
-        f"Vocabulary: {tov.get('vocabulary','—')}\n"
-        f"Topics: {', '.join(tov.get('topics', []))}"
-    )
-    biz_text = (
-        f"Company: {business.get('company_name','—')}\n"
-        f"What they do: {business.get('what_they_do','—')}\n"
-        f"Industry: {business.get('industry','—')}\n"
-        f"Target audience: {business.get('target_audience','—')}\n"
-        f"Unique angle: {business.get('unique_angle','—')}"
-    ) if business else "Not captured"
-    tx_text = "\n".join(
-        f"{'Founder' if m['role']=='user' else 'Bot'}: {m['content']}"
-        for m in transcript
-    )
-
-    children = [
-        _h2("Business Information"), _txt(biz_text),    _div(),
-        _h2("Archetype blend"),      _txt(arch_line),   _div(),
-        _h2("Personality dimensions"), _txt(dims_text), _div(),
-        _h2("Tone of voice"),        _txt(tov_text),    _div(),
-        _h2("Full transcript"),      _txt(tx_text[:1900]),
-    ]
-
-    page = notion.pages.create(
-        parent={"database_id": NOTION_DATABASE_ID},
-        properties={
-            "Name":       {"title": [{"text": {"content": name}}]},
-            "TelegramID": {"rich_text": [{"text": {"content": str(uid)}}]},
-        },
-        children=children
-    )
-    url = f"https://notion.so/{page['id'].replace('-','')}"
-    print(f"[Notion] Profile saved → {url}")
-    return url
-
-
-def save_approved_post_to_notion(page_id: str, news_topic: str,
-                                  founder_idea: str, post_text: str):
-    today = datetime.utcnow().strftime("%B %d, %Y")
-    notion.blocks.children.append(
-        block_id=page_id,
-        children=[
-            _div(),
-            _h3(f"Approved post — {today}"),
-            _txt(f"News hook: {news_topic}"),
-            _txt(f"Founder idea: {founder_idea[:300]}"),
-            {"object": "block", "type": "quote",
-             "quote": {"rich_text": [{"type": "text", "text": {"content": post_text[:1900]}}]}},
-        ]
-    )
-    print(f"[Notion] Post saved to {page_id[:8]}...")
-
-
-# ── HeyGen pipeline webhook ───────────────────────────────────────────────────
-
-async def trigger_heygen_pipeline(payload: dict):
-    """
-    Fire-and-forget POST to n8n webhook.
-    n8n receives this and runs: HeyGen → ElevenLabs → merge → subtitles → Sheet.
-
-    Payload keys (all sent in JSON body — n8n reads them via {{ $json.key }}):
-      founder_name   — e.g. "Rahul"
-      founder_id     — Telegram user ID (int)
-      post_text      — the approved LinkedIn post text
-      news_topic     — the headline/topic that was picked
-      notion_page_id — Notion page ID where the post was saved
-      approved_at    — ISO timestamp of approval
-    """
-    if not N8N_HEYGEN_WEBHOOK_URL:
-        print("[HeyGen] N8N_HEYGEN_WEBHOOK_URL not set — skipping webhook")
-        return
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                N8N_HEYGEN_WEBHOOK_URL,
-                json=payload,                          # sent as JSON body
-                headers={"Content-Type": "application/json"},
-            )
-        if r.status_code in (200, 202):
-            print(f"[HeyGen] Webhook sent ✓ (HTTP {r.status_code}) for {payload.get('founder_name')}")
-        else:
-            print(f"[HeyGen] Webhook returned {r.status_code}: {r.text[:120]}")
-    except Exception as e:
-        print(f"[HeyGen] Webhook failed: {e}")
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# POST GENERATION (was model.py — merged here)
-# ════════════════════════════════════════════════════════════════════════════════
+# ── Post generation ───────────────────────────────────────────────────────────
 
 def _build_tov_instruction(tov: dict) -> str:
-    """Build writing style instruction from TOV JSON."""
     if not tov:
         return ""
     return (
@@ -457,13 +418,23 @@ async def generate_post(
     edit_instruction: str = "",
     is_business_idea: bool = False,
 ) -> tuple[str, dict]:
-    """
-    Generate or regenerate a LinkedIn post.
-    Returns (post_text, founder_profile).
-    """
-    profile = get_founder_profile_from_notion(uid)
+    # ← CHANGED: reads from Supabase instead of Notion
+    profile = get_founder_profile_from_supabase(uid)
     name    = profile["name"]
     tov_ins = _build_tov_instruction(profile["tov_json"])
+
+    if not profile["profile_text"]:
+        try:
+            async with httpx.AsyncClient(timeout=10) as _c:
+                await _c.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": uid,
+                        "text": "⚠️ I don't have your profile yet — run /start to set it up. I'll generate a basic post for now.",
+                    },
+                )
+        except Exception:
+            pass
 
     print(f"[Generate] {name} | topic: {news_topic[:50]} | idea: {founder_idea[:60]}")
 
@@ -519,9 +490,7 @@ async def generate_post(
     print(f"[Generate] Done — {len(post)} chars")
     return post, profile
 
-# ════════════════════════════════════════════════════════════════════════════════
-# INTERVIEW LOGIC
-# ════════════════════════════════════════════════════════════════════════════════
+# ── Interview logic ───────────────────────────────────────────────────────────
 
 INTERVIEW_SYSTEM = """\
 You are conducting a friendly interview to build a founder's content personality profile.
@@ -546,6 +515,65 @@ Archetypes: Naval Ravikant, Gary Vaynerchuk, Simon Sinek, Brene Brown, Balaji Sr
 OPENING = "Hey {name}! I'll ask you a few questions to understand how you think and communicate. No right or wrong answers — just be real. Ready?"
 FIRST_Q = "Tell me the real reason you started your company — not the pitch, the actual reason."
 
+ONBOARDING_MSG = """\
+Welcome to Founder Voice! Here's how this works 👇
+
+Every morning at 7AM, you'll get:
+• 3 viral topics trending in India right now
+• 5 news stories from your niche
+• 2 content ideas based on your business
+
+To create a LinkedIn post:
+1️⃣ Reply with a number (like "3") to pick a topic
+2️⃣ Share your angle — as a voice note OR text
+3️⃣ Get a ghostwritten LinkedIn post in your voice
+
+📱 How to send a voice note on Telegram:
+Hold the 🎙 mic button → speak → release to send.
+
+Once your draft is ready, you can:
+• ✅ Approve — saves it and starts your video
+• ⏭ Next — see a different version
+• ✂️ Shorter / 📝 Longer — adjust the length
+• Or just type feedback: "make it more personal" / "add a hook"
+
+First, let's build your content profile (5 min). This is what makes every post sound like YOU.\
+"""
+
+RETURNING_WELCOME = """\
+Hey {name}, welcome back! 👋
+
+Your morning digest arrives at 7AM — trending news + content ideas built around your business.
+
+Reply with a number to pick a topic, share your angle, and get your LinkedIn draft in seconds.
+
+Use /draft to see today's topics, or /help for all commands.\
+"""
+
+OFF_TOPIC_PATTERNS = (
+    r'\bwhat (is|are|was|were)\b',
+    r'\bwho (is|are|was|were)\b',
+    r'\bwhen (is|was|will)\b',
+    r'\bhow (do|does|did|can|could|would|should)\b',
+    r'\bwhy (is|are|was|did)\b',
+    r'\bwhat.*(date|time|day|year)\b',
+    r'\btell me (about|a joke|something)\b',
+    r'\bexplain\b',
+    r'\bsearch for\b',
+    r'\bjoke\b',
+    r'\bweather\b',
+    r'\btranslate\b',
+    r'\bcalculate\b',
+    r'\bwrite (a poem|an essay|a story|code|a song)\b',
+)
+
+OFF_TOPIC_REPLY = (
+    "I'm your LinkedIn content assistant — I help you turn ideas into posts.\n\n"
+    "To edit your draft, reply with:\n"
+    "• ✂️ Shorter / 📝 Longer / ⏭ Next\n"
+    "• Or describe the change: \"make it more personal\" / \"add a hook at the start\""
+)
+
 
 def parse_profile(text: str) -> dict | None:
     if "===INTERVIEW_COMPLETE===" not in text:
@@ -566,7 +594,7 @@ def build_summary(name: str, p: dict) -> str:
     tov      = p.get("tov", {})
     business = p.get("business", {})
     top3     = sorted(dims.items(), key=lambda x: x[1], reverse=True)[:3]
-    top3_str = ", ".join(f"{k.replace('_',' ')} ({v})" for k, v in top3)
+    top3_str = ", ".join(f"{k.replace('_', ' ')} ({v})" for k, v in top3)
 
     biz_line = ""
     if business.get("company_name"):
@@ -574,20 +602,20 @@ def build_summary(name: str, p: dict) -> str:
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"YOUR BUSINESS\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Company : {business.get('company_name','—')}\n"
-            f"You do  : {business.get('what_they_do','—')}\n"
-            f"Audience: {business.get('target_audience','—')}\n"
-            f"Edge    : {business.get('unique_angle','—')}\n"
+            f"Company : {business.get('company_name', '—')}\n"
+            f"You do  : {business.get('what_they_do', '—')}\n"
+            f"Audience: {business.get('target_audience', '—')}\n"
+            f"Edge    : {business.get('unique_angle', '—')}\n"
         )
 
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"PROFILE READY, {name.upper()}!\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Archetype : {arch.get('primary','—')} ({int(float(arch.get('primary_weight',0))*100)}%)"
-        f" + {arch.get('secondary','—')} ({int(float(arch.get('secondary_weight',0))*100)}%)\n"
+        f"Archetype : {arch.get('primary', '—')} ({int(float(arch.get('primary_weight', 0)) * 100)}%)"
+        f" + {arch.get('secondary', '—')} ({int(float(arch.get('secondary_weight', 0)) * 100)}%)\n"
         f"Strengths : {top3_str}\n"
-        f"Hook style: {tov.get('hook_style','—')}\n"
+        f"Hook style: {tov.get('hook_style', '—')}\n"
         f"Topics    : {', '.join(tov.get('topics', []))}"
         f"{biz_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -631,26 +659,27 @@ async def process_interview(update: Update, uid: int, text: str):
             return
 
         try:
-            url = save_profile_to_notion(name, profile, session["transcript"], uid)
+            # ← CHANGED: saves to Supabase instead of Notion
+            founder_id = await save_profile_to_supabase(name, profile, session["transcript"], uid)
             await send_reply(update, build_summary(name, profile))
-            await update.message.reply_text(f"Profile saved: {url}")
+            if founder_id:
+                await update.message.reply_text("✅ Profile saved!")
+            else:
+                await update.message.reply_text("Profile built! (Save may have failed — admin will check.)")
+            # Log the event
+            asyncio.create_task(log_to_supabase(str(uid), "interview_complete", f"Profile saved for {name}", {"founder_id": founder_id}))
         except Exception as e:
             await send_reply(update, build_summary(name, profile))
-            await update.message.reply_text(
-                f"Profile built! Notion save failed: {str(e)[:100]}\n"
-                "Check your Notion integration is connected."
-            )
+            await update.message.reply_text(f"Profile built! Save failed: {str(e)[:100]}")
         return
 
     await send_reply(update, response.strip())
 
-# ════════════════════════════════════════════════════════════════════════════════
-# NEWS + POST INTERACTION
-# ════════════════════════════════════════════════════════════════════════════════
+# ── News selection + post generation ─────────────────────────────────────────
+# (unchanged from original — only generate_post() reads from Supabase now)
 
 async def handle_news_selection(update: Update, uid: int, text: str) -> bool:
-    """Detect number reply (1-9), store selected topic (trending or business idea)."""
-    if not re.match(r'^[1-9]$', text.strip()):
+    if not re.match(r'^\d+$', text.strip()):
         return False
 
     digest     = get_today_digest(uid)
@@ -665,12 +694,10 @@ async def handle_news_selection(update: Update, uid: int, text: str) -> bool:
 
     if num > total:
         await update.message.reply_text(
-            f"I sent {total} topics today (1–{total}).\n"
-            f"Reply with a number in that range."
+            f"I sent {total} topics today (1–{total}).\nReply with a number in that range."
         )
         return True
 
-    # Determine if trending or business idea
     if num <= len(news_items):
         selected = next((n for n in news_items if n.get("number") == num), None)
         if not selected:
@@ -695,8 +722,6 @@ async def handle_news_selection(update: Update, uid: int, text: str) -> bool:
         "waiting_for_idea": True,
     }
 
-    print(f"[Bot] {uid} selected #{num}: {selected.get('headline','')[:50]} (business={is_business})")
-
     type_tag = "YOUR IDEA" if is_business else "TRENDING"
     await update.message.reply_text(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -711,14 +736,12 @@ async def handle_news_selection(update: Update, uid: int, text: str) -> bool:
 
 
 async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
-    """Generate post once founder sends their idea."""
     sel = news_selections.get(uid)
     if not sel or not sel.get("waiting_for_idea"):
         return False
 
     news_topic       = sel["headline"]
     is_business_idea = sel.get("is_business_idea", False)
-    print(f"[Bot] Idea received from {uid}: {idea_text[:80]}")
 
     await update.message.reply_text("Writing your post...")
     await update.message.reply_chat_action("typing")
@@ -736,29 +759,36 @@ async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
         return True
 
     pending_drafts[uid] = {
-        "founder_name":    profile.get("name", ""),
-        "page_id":         profile.get("page_id"),
-        "news_topic":      news_topic,
-        "founder_idea":    idea_text,
-        "current_draft":   post_text,
+        "founder_name":     profile.get("name", ""),
+        "page_id":          profile.get("page_id"),
+        "news_topic":       news_topic,
+        "founder_idea":     idea_text,
+        "current_draft":    post_text,
         "is_business_idea": is_business_idea,
-        "version":         1,
+        "version":          1,
     }
     save_pending()
     news_selections.pop(uid, None)
 
-    await update.message.reply_text(
+    await _send_with_retry(
+        update.message.reply_text,
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"YOUR LINKEDIN POST  v1\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{post_text}",
         reply_markup=draft_keyboard(),
+        label="founder_idea post",
     )
     return True
 
 
+def _is_off_topic(text: str) -> bool:
+    """Return True if text looks like a general-purpose LLM query, not a post-edit instruction."""
+    lower = text.lower()
+    return any(re.search(pat, lower) for pat in OFF_TOPIC_PATTERNS)
+
+
 async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
-    """Handle APPROVE/SKIP/NEXT/SHORTER/LONGER and free text edits."""
     draft = get_draft(uid)
     if not draft:
         return False
@@ -775,34 +805,27 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
 
     is_biz = draft.get("is_business_idea", False)
 
-    # APPROVE
+    # APPROVE — ← CHANGED: fires to Supabase webhook instead of Notion + n8n
     if cmd in ("APPROVE", "/APPROVE"):
-        await update.message.reply_text("Saving to Notion...")
         try:
-            if draft.get("page_id"):
-                save_approved_post_to_notion(
-                    draft["page_id"], draft.get("news_topic", ""),
-                    draft.get("founder_idea", ""), draft.get("current_draft", "")
-                )
-            await update.message.reply_text(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "POST APPROVED ✅\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Saved to Notion.\n"
-                "🎬 Sending to video pipeline..."
+            asyncio.create_task(trigger_video_pipeline({
+                "founder_name":   draft.get("founder_name", ""),
+                "founder_id":     uid,              # telegram_id
+                "post_text":      draft.get("current_draft", ""),
+                "news_topic":     draft.get("news_topic", ""),
+                "notion_page_id": draft.get("page_id", ""),  # kept for reference
+                "approved_at":    datetime.utcnow().isoformat(),
+            }))
+            approval_msg = (
+                "Your post is saved! 🎉\n"
+                "We're creating your video — you'll get a notification when it's ready.\n"
+                "Keep crushing it. 💪"
             )
+            if ADMIN_DASHBOARD_URL:
+                approval_msg += f"\n\nTrack it here: {ADMIN_DASHBOARD_URL}"
+            await update.message.reply_text(approval_msg)
         except Exception as e:
-            await update.message.reply_text(f"Approved! (Notion error: {str(e)[:80]})")
-
-        # Fire webhook to n8n — non-blocking, runs in background
-        asyncio.create_task(trigger_heygen_pipeline({
-            "founder_name":   draft.get("founder_name", ""),
-            "founder_id":     uid,
-            "post_text":      draft.get("current_draft", ""),
-            "news_topic":     draft.get("news_topic", ""),
-            "notion_page_id": draft.get("page_id", ""),
-            "approved_at":    datetime.utcnow().isoformat(),
-        }))
+            await update.message.reply_text(f"Approved! (Error: {str(e)[:80]})")
 
         clear_draft(uid)
         return True
@@ -873,14 +896,19 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
         await update.message.reply_text(_draft_msg("EXPANDED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
         return True
 
-    # Free text edit feedback
+    # Free text edit
     if len(text.strip()) > 3 and not text.startswith("/"):
+        if _is_off_topic(text):
+            await update.message.reply_text(OFF_TOPIC_REPLY)
+            return True
         await update.message.reply_chat_action("typing")
         await update.message.reply_text("Rewriting with your feedback...")
         try:
             new_post, _ = await generate_post(
                 uid, draft["news_topic"], draft["founder_idea"],
-                draft["current_draft"], text, is_business_idea=is_biz,
+                draft["current_draft"],
+                text.strip(),
+                is_business_idea=is_biz,
             )
         except Exception as e:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
@@ -888,162 +916,71 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
         draft["current_draft"] = new_post
         pending_drafts[uid]    = draft
         save_pending()
-        await update.message.reply_text(_draft_msg("UPDATED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
+        await update.message.reply_text(_draft_msg("EDITED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
         return True
 
     return False
 
-# ── Inline keyboard callback handler ─────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all inline keyboard button taps (APPROVE / NEXT / SHORTER / LONGER / SKIP)."""
     query = update.callback_query
-    await query.answer()          # clears the tap-loading spinner immediately
-    uid   = query.from_user.id
-    cmd   = query.data            # "APPROVE" | "NEXT" | "SHORTER" | "LONGER" | "SKIP"
-    msg   = query.message
+    await query.answer()
+    uid  = query.from_user.id
+    data = query.data
 
-    draft = get_draft(uid)
-    if not draft:
-        await msg.reply_text("No active draft. Pick a topic from today's digest.")
-        return
+    class _FakeUpdate:
+        message = query.message
+        effective_user = query.from_user
 
-    is_biz = draft.get("is_business_idea", False)
+    await handle_draft_reply(_FakeUpdate(), uid, data)
 
-    def _dmsg(label: str, post: str, ver: int) -> str:
-        return (
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"YOUR LINKEDIN POST  v{ver}  [{label}]\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{post}"
-        )
+# ── Commands ──────────────────────────────────────────────────────────────────
 
-    # ── APPROVE ───────────────────────────────────────────────────────────────
-    if cmd == "APPROVE":
-        await msg.reply_text("Saving to Notion...")
+async def _send_with_retry(send_fn, *args, label: str = "", **kwargs):
+    """Retry a Telegram send call up to 3 times on TimedOut/NetworkError."""
+    delays = [1, 2, 4]
+    last_exc = None
+    for attempt, delay in enumerate(delays, 1):
         try:
-            if draft.get("page_id"):
-                save_approved_post_to_notion(
-                    draft["page_id"], draft.get("news_topic", ""),
-                    draft.get("founder_idea", ""), draft.get("current_draft", "")
-                )
-            await msg.reply_text(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "POST APPROVED ✅\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Saved to Notion.\n"
-                "🎬 Sending to video pipeline..."
-            )
-        except Exception as e:
-            await msg.reply_text(f"Approved! (Notion error: {str(e)[:80]})")
-        asyncio.create_task(trigger_heygen_pipeline({
-            "founder_name":   draft.get("founder_name", ""),
-            "founder_id":     uid,
-            "post_text":      draft.get("current_draft", ""),
-            "news_topic":     draft.get("news_topic", ""),
-            "notion_page_id": draft.get("page_id", ""),
-            "approved_at":    datetime.utcnow().isoformat(),
-        }))
-        clear_draft(uid)
-
-    # ── SKIP ──────────────────────────────────────────────────────────────────
-    elif cmd == "SKIP":
-        clear_draft(uid)
-        await msg.reply_text("Skipped.\nReply with a different topic number or wait for tomorrow's digest.")
-
-    # ── NEXT ──────────────────────────────────────────────────────────────────
-    elif cmd == "NEXT":
-        await msg.reply_chat_action("typing")
-        try:
-            new_post, _ = await generate_post(
-                uid, draft["news_topic"], draft["founder_idea"],
-                draft["current_draft"],
-                "Write a completely different version — different hook, different angle, same topic and idea.",
-                is_business_idea=is_biz,
-            )
-        except Exception as e:
-            await msg.reply_text(f"Error: {str(e)[:80]}")
+            await send_fn(*args, **kwargs)
             return
-        draft["current_draft"] = new_post
-        draft["version"]       = draft.get("version", 1) + 1
-        pending_drafts[uid]    = draft
-        save_pending()
-        await msg.reply_text(_dmsg("NEW VERSION", new_post, draft["version"]), reply_markup=draft_keyboard())
-
-    # ── SHORTER ───────────────────────────────────────────────────────────────
-    elif cmd == "SHORTER":
-        await msg.reply_chat_action("typing")
-        try:
-            new_post, _ = await generate_post(
-                uid, draft["news_topic"], draft["founder_idea"],
-                draft["current_draft"],
-                "Make it shorter — cut at least 30% of words. Keep the core message and voice.",
-                is_business_idea=is_biz,
-            )
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            print(f"[send_retry] {label} attempt {attempt} failed ({e.__class__.__name__}) — retrying in {delay}s")
+            await asyncio.sleep(delay)
         except Exception as e:
-            await msg.reply_text(f"Error: {str(e)[:80]}")
+            print(f"[send_retry] {label} non-retryable error: {e}")
             return
-        draft["current_draft"] = new_post
-        pending_drafts[uid]    = draft
-        save_pending()
-        await msg.reply_text(_dmsg("SHORTER", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
-
-    # ── LONGER ────────────────────────────────────────────────────────────────
-    elif cmd == "LONGER":
-        await msg.reply_chat_action("typing")
-        try:
-            new_post, _ = await generate_post(
-                uid, draft["news_topic"], draft["founder_idea"],
-                draft["current_draft"],
-                "Expand it — add a personal story or example, more depth. Keep their voice.",
-                is_business_idea=is_biz,
-            )
-        except Exception as e:
-            await msg.reply_text(f"Error: {str(e)[:80]}")
-            return
-        draft["current_draft"] = new_post
-        pending_drafts[uid]    = draft
-        save_pending()
-        await msg.reply_text(_dmsg("EXPANDED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
+    print(f"[send_retry] {label} gave up after {len(delays)} attempts: {last_exc}")
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TELEGRAM COMMAND HANDLERS
-# ════════════════════════════════════════════════════════════════════════════════
+async def send_reply(update: Update, text: str):
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for i, chunk in enumerate(chunks):
+        await _send_with_retry(update.message.reply_text, chunk, label=f"chunk {i+1}/{len(chunks)}")
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
-    name = update.effective_user.first_name or "there"
-    auto_save_telegram_id(name, uid)
-    clear_draft(uid)
-    news_selections.pop(uid, None)
-    sessions[uid] = {"name": name, "messages": [], "transcript": [], "done": False}
+    name = update.effective_user.first_name or "Founder"
 
-    # Send onboarding GIF/animation if configured, with voice note instructions
-    if WELCOME_GIF:
-        voice_tip = (
-            "HOW TO SEND A VOICE NOTE\n\n"
-            "1. Hold the microphone button (bottom right)\n"
-            "2. Speak your idea naturally\n"
-            "3. Release to send\n\n"
-            "You can also just type if you prefer."
-        )
-        try:
-            if WELCOME_GIF.startswith("http"):
-                await update.message.reply_animation(animation=WELCOME_GIF, caption=voice_tip)
-            else:
-                with open(WELCOME_GIF, "rb") as f:
-                    await update.message.reply_animation(animation=f, caption=voice_tip)
-        except Exception as e:
-            print(f"[Start] GIF send failed: {e}")
-        await asyncio.sleep(0.5)
+    # Check if profile already exists in Supabase
+    profile = get_founder_profile_from_supabase(uid)
+    if profile["profile_text"]:
+        await update.message.reply_text(RETURNING_WELCOME.format(name=profile['name']))
+        return
 
-    opening = OPENING.format(name=name)
-    sessions[uid]["messages"] = [{"role": "assistant", "content": opening + " " + FIRST_Q}]
-    await send_reply(update, opening)
+    sessions[uid] = {
+        "name":      name,
+        "messages":  [],
+        "transcript": [],
+        "done":      False,
+    }
+    await update.message.reply_text(ONBOARDING_MSG)
+    await asyncio.sleep(1)
+    await update.message.reply_text(OPENING.format(name=name))
     await asyncio.sleep(0.5)
-    await send_reply(update, FIRST_Q)
-    print(f"[Start] {name} ({uid})")
+    await update.message.reply_text(FIRST_Q)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,31 +988,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    draft = get_draft(uid)
-    sel   = news_selections.get(uid)
-    sess  = sessions.get(uid)
-    news  = get_today_news(uid)
-
-    digest    = get_today_digest(uid)
+    uid    = update.effective_user.id
+    draft  = get_draft(uid)
+    sel    = news_selections.get(uid)
+    sess   = sessions.get(uid)
+    digest = get_today_digest(uid)
     all_topics = len(digest["news_items"]) + len(digest["business_ideas"])
 
     if draft:
         await update.message.reply_text(
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"STATUS: DRAFT READY  v{draft.get('version',1)}\n"
+            f"STATUS: DRAFT READY v{draft.get('version', 1)}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Topic: {draft.get('news_topic','?')}\n\n"
-            f"Use /draft to view it.\n"
-            f"APPROVE · NEXT · SHORTER · LONGER · SKIP"
+            f"Topic: {draft.get('news_topic', '')[:60]}\n\n"
+            f"APPROVE / NEXT / SHORTER / LONGER\nor send feedback as text.",
+            reply_markup=draft_keyboard(),
         )
     elif sel and sel.get("waiting_for_idea"):
-        type_tag = "YOUR IDEA" if sel.get("is_business_idea") else "TRENDING"
         await update.message.reply_text(
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"STATUS: WAITING FOR YOUR TAKE [{type_tag}]\n"
+            f"STATUS: WAITING FOR YOUR TAKE\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{sel.get('headline','?')}\n\n"
+            f"{sel.get('headline', '?')}\n\n"
             f"Send a voice note or text with your angle."
         )
     elif sess and not sess.get("done"):
@@ -1084,8 +1018,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"STATUS: PROFILE INTERVIEW\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Progress: {count}/15 questions answered.\n"
-            f"Answer the question above to continue."
+            f"Progress: {count}/15 questions answered."
         )
     elif all_topics > 0:
         await update.message.reply_text(
@@ -1093,32 +1026,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"STATUS: TOPICS READY\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{len(digest['news_items'])} trending  +  {len(digest['business_ideas'])} your ideas\n\n"
-            f"Reply with a number (1–{all_topics}) to pick a topic.\n"
-            f"Use /draft to see the full list."
+            f"Reply with a number (1–{all_topics}) to pick a topic."
         )
     else:
         await update.message.reply_text(
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "STATUS: WAITING\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Morning digest arrives at 7AM.\n"
-            "Use /start if you haven't done your profile interview yet."
+            "Morning digest arrives at 7AM."
         )
 
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_chat_action("typing")
-    try:
-        profile = get_founder_profile_from_notion(uid)
-        if not profile["profile_text"]:
-            await update.message.reply_text("No profile found. Send /start to create yours.")
-            return
-        await update.message.reply_text(
-            f"Your content profile:\n\n{profile['profile_text'][:1500]}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)[:80]}")
+    # ← CHANGED: reads from Supabase
+    profile = get_founder_profile_from_supabase(uid)
+    if not profile["profile_text"]:
+        await update.message.reply_text("No profile found. Send /start to create yours.")
+        return
+    await update.message.reply_text(
+        f"Your content profile:\n\n{profile['profile_text'][:1500]}"
+    )
 
 
 async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1131,8 +1060,8 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"YOUR LINKEDIN POST  v{ver}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Topic: {draft.get('news_topic','')}\n\n"
-            f"{draft.get('current_draft','')}",
+            f"Topic: {draft.get('news_topic', '')}\n\n"
+            f"{draft.get('current_draft', '')}",
             reply_markup=draft_keyboard(),
         )
         return
@@ -1142,19 +1071,16 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     biz_ideas = digest["business_ideas"]
 
     if news or biz_ideas:
-        lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                 "TODAY'S CONTENT IDEAS\n"
-                 "━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+        lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━\nTODAY'S CONTENT IDEAS\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
         if news:
             lines.append("📰 TRENDING\n")
             for item in news:
-                lines.append(f"{item.get('number','?')}. {item.get('headline','')}")
+                lines.append(f"{item.get('number', '?')}. {item.get('headline', '')}")
         if biz_ideas:
             lines.append("\n💡 YOUR BUSINESS IDEAS\n")
             for item in biz_ideas:
-                lines.append(f"{item.get('number','?')}. {item.get('headline','')}")
-        lines.append(f"\n─────────────────────────────")
-        lines.append(f"Reply with a number (1–{len(news)+len(biz_ideas)}) to pick one.")
+                lines.append(f"{item.get('number', '?')}. {item.get('headline', '')}")
+        lines.append(f"\nReply with a number (1–{len(news)+len(biz_ideas)}) to pick one.")
         await update.message.reply_text("\n".join(lines))
     else:
         await update.message.reply_text("No content ideas yet.\nMorning digest arrives at 7AM.")
@@ -1174,33 +1100,25 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     news_selections.pop(uid, None)
     await update.message.reply_text("All cleared. Send /start to begin your profile interview.")
 
-# ── Voice + text handlers ─────────────────────────────────────────────────────
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_chat_action("typing")
 
+    if not USE_VOICE:
+        await update.message.reply_text("🎙 Voice notes require ElevenLabs. Please type your message.")
+        return
+
     ogg  = bytes(await (await update.message.voice.get_file()).download_as_bytearray())
     text = await stt(ogg)
 
     if not text:
-        sel = news_selections.get(uid)
-        if sel and sel.get("waiting_for_idea"):
-            await update.message.reply_text(
-                "Couldn't transcribe. Please type your idea instead."
-            )
-        elif get_draft(uid):
-            await update.message.reply_text(
-                "Couldn't transcribe. Type your feedback, e.g. 'make it shorter'."
-            )
-        else:
-            await update.message.reply_text("Couldn't transcribe. Please type your message.")
+        await update.message.reply_text("🎙 Couldn't transcribe. Please type instead.")
         return
 
     await update.message.reply_text(random.choice([
         "Got it...", "On it...", "Processing...", "Noted...",
-        "Thinking...", "Cooking...", "On it...", "Capturing...",
-        "Got your take...", "Working on it...", "Crafting...",
+        "Thinking...", "Cooking...", "Capturing...", "Working on it...",
     ]))
     await route_message(update, uid, text)
 
@@ -1212,32 +1130,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def route_message(update: Update, uid: int, text: str):
-    """Route every message through handlers in priority order."""
-
-    # 1. Draft edit/approval
     if await handle_draft_reply(update, uid, text):
         return
-
-    # 2. Founder sending their idea (after selecting news)
     if await handle_founder_idea(update, uid, text):
         return
-
-    # 3. News topic number selection
     if await handle_news_selection(update, uid, text):
         return
-
-    # 4. Active interview
     if uid in sessions and not sessions[uid].get("done"):
         await process_interview(update, uid, text)
         return
-
-    # 5. Check for stale draft after bot restart
-    load_pending()
     if uid in pending_drafts:
         await handle_draft_reply(update, uid, text)
         return
 
-    # 6. Fallback
     digest    = get_today_digest(uid)
     all_count = len(digest["news_items"]) + len(digest["business_ideas"])
     if all_count > 0:
@@ -1249,28 +1154,26 @@ async def route_message(update: Update, uid: int, text: str):
     else:
         await update.message.reply_text(
             "Morning digest arrives at 7AM.\n"
-            "Use /start if you haven't done your profile yet.\n"
-            "Use /help to see all commands."
+            "Use /start if you haven't done your profile yet."
         )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
     await app.bot.set_my_commands(BOT_COMMANDS)
-    print("[Bot] Command menu set in Telegram")
+    print("[Bot] Command menu set")
 
 
 def main():
     load_pending()
 
     print("=" * 48)
-    print("  FOUNDER VOICE BOT — FINAL")
+    print("  FOUNDER VOICE BOT — SUPABASE EDITION")
     print("=" * 48)
-    print(f"  Model  : {CLAUDE_MODEL}")
-    print(f"  Voice  : {'ON' if USE_VOICE else 'OFF (text only)'}")
-    print(f"  Notion : {NOTION_DATABASE_ID[:8]}...")
-    print(f"  Drafts : {len(pending_drafts)} pending")
-    print("  Flow   : 7AM news → pick topic → voice idea → post")
+    print(f"  Model     : {CLAUDE_MODEL}")
+    print(f"  Voice     : {'ON' if USE_VOICE else 'OFF'}")
+    print(f"  Supabase  : {SUPABASE_URL[:40]}...")
+    print(f"  Drafts    : {len(pending_drafts)} pending")
     print("=" * 48)
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
