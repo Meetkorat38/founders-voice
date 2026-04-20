@@ -825,7 +825,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
                 "Keep crushing it. 💪"
             )
             if ADMIN_DASHBOARD_URL:
-                approval_msg += f"\n\nSent you video soon!"
+                approval_msg += f"\n\nSent you video soon"
             await update.message.reply_text(approval_msg)
         except Exception as e:
             await update.message.reply_text(f"Approved! (Error: {str(e)[:80]})")
