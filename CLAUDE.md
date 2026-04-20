@@ -31,20 +31,31 @@ python bot.py
 ```
 TELEGRAM_TOKEN
 OPENROUTER_API_KEY
+FIRECRAWL_API_KEY
 SUPABASE_URL
-SUPABASE_ANON_KEY          # used by bot.py & content_engine.py (anon key for REST + edge function calls)
+SUPABASE_SERVICE_ROLE_KEY   # used server-side by bot.py & content_engine.py — bypasses RLS
+SUPABASE_ANON_KEY           # fallback for local dev; also used by the admin dashboard
 
 # Optional
-CLAUDE_MODEL=anthropic/claude-sonnet-4-5    # default
+CLAUDE_MODEL=anthropic/claude-sonnet-4-6    # default
 SEARCH_MODEL=perplexity/sonar-pro           # default
 ELEVENLABS_API_KEY
 ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM   # default
-WEBHOOK_SECRET                              # must match Supabase edge function secret
+WEBHOOK_SECRET                              # sent as x-webhook-secret if set
 ADMIN_DASHBOARD_URL                         # shown to founder after approval
+FOUNDER_CONCURRENCY=5                       # content_engine parallelism
 WELCOME_GIF
 ```
 
 Notion vars (`NOTION_TOKEN`, `NOTION_DATABASE_ID`) and `N8N_HEYGEN_WEBHOOK_URL` have been removed.
+
+## Railway deployment
+
+- [Procfile](Procfile) declares `worker: python bot.py`. [railway.json](railway.json) pins `numReplicas: 1`.
+- `bot.py` uses Telegram long-polling, so the worker service MUST stay at **1 replica**. Two replicas both poll, one wins, the other silently 409s.
+- `content_engine.py` is a **separate Railway service** (same repo), start command `python content_engine.py`, with Railway cron schedule `30 1 * * *` (7 AM IST = 01:30 UTC).
+- Python version is pinned by [runtime.txt](runtime.txt) (`python-3.11.9`). Bump it there, not in Nixpacks.
+- Both services must be on a paid Railway plan — Hobby sleeps projects and the 7 AM cron won't fire.
 
 ## Architecture — data flow
 
@@ -79,22 +90,26 @@ content_engine.py  →  news_digest.json  →  bot.py reads on founder reply
 - `save-founder-profile` — upserts founder row on `/start` interview completion
 - `webhook-post-approved` — saves approved post and auto-triggers HeyGen video pipeline
 
-`bot.py` & `content_engine.py` uses `SUPABASE_ANON_KEY` for all calls.
+`bot.py` & `content_engine.py` use `SUPABASE_SERVICE_ROLE_KEY` for all calls (bypasses RLS). RLS is enabled with no anon policies on `pending_drafts` / `daily_digests`, so a leaked anon key can't read or wipe bot state.
 
-## Shared state files
+## Persistent state (Supabase tables)
 
-- **`news_digest.json`** — written by `content_engine.py`, read by `bot.py`. Keyed by Telegram user ID string. Contains `news_items` (viral + niche, each with `type` field) and `business_ideas` arrays with numbered items.
-- **`pending_drafts.json`** — written/read by `bot.py`. Stores in-progress drafts waiting for founder action. Keyed by Telegram user ID int.
+- **`pending_drafts`** — one row per active draft, keyed by `telegram_id`. Managed by `get_draft` / `save_draft` / `delete_draft` in bot.py.
+- **`daily_digests`** — one row per founder per day, keyed by `(telegram_id, sent_date)`. Written by `content_engine.py`, read by `bot.py` via `get_today_digest`. Idempotent per day — re-running the cron overwrites the same row.
+- **`approved_posts`** — populated by the `webhook-post-approved` edge function when the founder taps ✅ Approve.
+- **`founders`** — onboarding profiles. Written by the `save-founder-profile` edge function on `/start` interview completion.
+- **`bot_logs`** — fire-and-forget event log.
 
-## In-memory state in bot.py
+RLS lockdown: [supabase/migrations/0001_lock_rls_to_service_role.sql](supabase/migrations/0001_lock_rls_to_service_role.sql). Run once in the Supabase SQL editor — enables RLS on all five tables with no anon policies.
 
-Three dicts hold per-user state at runtime (not persisted except `pending_drafts`):
+`news_digest.json` and `pending_drafts.json` on disk are legacy artefacts and should be deleted; they're already in [.gitignore](.gitignore).
 
-- **`sessions[uid]`** — active interview session: `{name, messages, transcript, done}`. Set by `/start`, cleared when interview completes.
-- **`news_selections[uid]`** — topic selected from digest, awaiting the founder's angle: `{headline, sector, is_business_idea, waiting_for_idea}`. Set in `handle_news_selection()`, cleared in `handle_founder_idea()`.
-- **`pending_drafts[uid]`** — draft awaiting APPROVE/SKIP/edit: `{founder_name, page_id, news_topic, founder_idea, current_draft, is_business_idea, version}`. Persisted to `pending_drafts.json`.
+## In-memory state in bot.py (ephemeral)
 
-Message routing in `handle_message()` checks these dicts in order: interview active → news selection → draft reply → unrecognised.
+- **`sessions[uid]`** — active interview session: `{name, messages, transcript, done}`. Set by `/start`, cleared when interview completes. Lost on restart — pragmatic trade-off; the user gets nudged to `/reset`.
+- **`news_selections[uid]`** — topic selected from digest, awaiting the founder's angle. Set in `handle_news_selection()`, cleared in `handle_founder_idea()`.
+
+Message routing in `route_message()` checks: draft reply → founder idea → news selection → interview → fallback.
 
 ## Key design decisions
 

@@ -30,8 +30,12 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 FIRECRAWL_API_KEY  = os.environ["FIRECRAWL_API_KEY"]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 SUPABASE_URL       = os.environ["SUPABASE_URL"]
-SUPABASE_ANON_KEY  = os.environ["SUPABASE_ANON_KEY"]
-CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
+# Prefer service_role server-side so RLS can stay locked. Falls back to anon for local dev.
+SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_ANON_KEY"]
+CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-6")
+
+# Cap concurrent founder processing so we don't storm Claude / Firecrawl with N parallel requests.
+FOUNDER_CONCURRENCY = int(os.environ.get("FOUNDER_CONCURRENCY", "5"))
 
 firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
 
@@ -39,11 +43,37 @@ firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
 
 def _sb_headers() -> dict:
     return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
+
+# ── Retry helpers ─────────────────────────────────────────────────────────────
+
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+async def _post_with_retry(
+    client: httpx.AsyncClient, url: str, *, headers: dict, json_body: dict,
+    attempts: int = 3, label: str = "http",
+) -> httpx.Response:
+    delay = 1.0
+    last_exc: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            r = await client.post(url, headers=headers, json=json_body)
+            if r.status_code not in _RETRYABLE_STATUS:
+                return r
+            print(f"[retry] {label} attempt {i}/{attempts} got {r.status_code} — retrying in {delay}s")
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+            print(f"[retry] {label} attempt {i}/{attempts} failed ({e.__class__.__name__}) — retrying in {delay}s")
+        if i < attempts:
+            await asyncio.sleep(delay)
+            delay *= 2
+    if last_exc:
+        raise last_exc
+    return r
 
 def get_all_founders() -> list[dict]:
     print("[Supabase] Loading founders...")
@@ -107,24 +137,33 @@ def _firecrawl_search(
     """
     Pass 1: Firecrawl /search. Returns flat list of {title, description, url, markdown, source}.
     Each result already carries a verified URL — no positional citation merge needed.
+    Retries once on any exception (Firecrawl 5xxs are routine).
     """
+    import time as _time
     print(f"[Firecrawl] query={query[:80]!r} sources={sources} tbs={tbs} limit={limit}")
-    try:
-        resp = firecrawl.search(
-            query=query,
-            sources=sources,
-            tbs=tbs,
-            limit=limit,
-            location=location,
-            scrape_options={
-                "formats": ["markdown"],
-                "onlyMainContent": True,
-                "parsers": [],
-                "proxy": "basic",
-            },
-        )
-    except Exception as e:
-        print(f"[Firecrawl] Exception: {e}")
+    resp = None
+    for attempt in (1, 2):
+        try:
+            resp = firecrawl.search(
+                query=query,
+                sources=sources,
+                tbs=tbs,
+                limit=limit,
+                location=location,
+                scrape_options={
+                    "formats": ["markdown"],
+                    "onlyMainContent": True,
+                    "parsers": [],
+                    "proxy": "basic",
+                },
+            )
+            break
+        except Exception as e:
+            print(f"[Firecrawl] attempt {attempt}/2 failed: {e}")
+            if attempt == 2:
+                return []
+            _time.sleep(3)
+    if resp is None:
         return []
 
     items: list[dict] = []
@@ -173,14 +212,15 @@ async def _claude_pick(
     )
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
+        r = await _post_with_retry(
+            client,
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://founderbot.app",
                 "X-Title":      "Founder News Engine",
             },
-            json={
+            json_body={
                 "model":      CLAUDE_MODEL,
                 "max_tokens": max_tokens,
                 "messages": [
@@ -188,6 +228,7 @@ async def _claude_pick(
                     {"role": "user",   "content": payload},
                 ],
             },
+            label="claude_pick",
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"].strip()
@@ -384,18 +425,20 @@ async def generate_content_ideas(founder: dict, start_num: int) -> list[dict]:
     )
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
+        r = await _post_with_retry(
+            client,
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://founderbot.app",
                 "X-Title":      "Founder News Engine",
             },
-            json={
+            json_body={
                 "model":      CLAUDE_MODEL,
                 "max_tokens": 600,
                 "messages":   [{"role": "user", "content": prompt}],
             },
+            label="generate_ideas",
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"].strip()
@@ -551,37 +594,35 @@ async def run():
     else:
         print("\n[Viral] No viral items — section will be skipped for all founders")
 
-    for founder in founders:
-        name = founder["name"]
-        print(f"\n{'─' * 48}")
-        print(f"  Processing: {name}")
-        print(f"{'─' * 48}")
+    sem = asyncio.Semaphore(FOUNDER_CONCURRENCY)
 
-        if not founder["telegram_id"]:
-            print(f"[Skip] No telegram_id for {name}")
-            continue
+    async def _process_founder(founder: dict):
+        async with sem:
+            name = founder["name"]
+            if not founder["telegram_id"]:
+                print(f"[Skip] No telegram_id for {name}")
+                return
+            print(f"\n{'─' * 48}\n  Processing: {name}\n{'─' * 48}")
+            try:
+                niche_start = len(viral_items) + 1
+                niche_items = await fetch_niche_news(founder, start_num=niche_start)
 
-        # Niche news numbered after viral (e.g. starts at 4 if 3 viral items)
-        niche_start = len(viral_items) + 1
-        niche_items = await fetch_niche_news(founder, start_num=niche_start)
+                ideas_start = len(viral_items) + len(niche_items) + 1
+                ideas       = await generate_content_ideas(founder, start_num=ideas_start)
 
-        # Ideas numbered after viral + niche
-        ideas_start = len(viral_items) + len(niche_items) + 1
-        ideas       = await generate_content_ideas(founder, start_num=ideas_start)
+                digest_msg = format_digest(name, viral_items, niche_items, ideas)
+                await send_telegram(founder["telegram_id"], digest_msg)
 
-        # Format and send
-        digest_msg = format_digest(name, viral_items, niche_items, ideas)
-        await send_telegram(founder["telegram_id"], digest_msg)
+                all_news_items = viral_items + niche_items
+                write_news_digest(founder["telegram_id"], name, all_news_items, ideas)
 
-        # Write to news_digest.json for bot.py
-        all_news_items = viral_items + niche_items
-        write_news_digest(founder["telegram_id"], name, all_news_items, ideas)
+                asyncio.create_task(log_digest_sent(
+                    founder["telegram_id"], name, len(all_news_items) + len(ideas)
+                ))
+            except Exception as e:
+                print(f"[Founder] {name} failed: {e}")
 
-        asyncio.create_task(log_digest_sent(
-            founder["telegram_id"], name, len(all_news_items) + len(ideas)
-        ))
-
-        await asyncio.sleep(2)
+    await asyncio.gather(*(_process_founder(f) for f in founders), return_exceptions=False)
 
     print(f"\n{'=' * 52}")
     print("  DIGEST SENT TO ALL FOUNDERS")

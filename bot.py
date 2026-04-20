@@ -9,7 +9,7 @@ Changes from previous version:
   - save_approved_post_to_notion() → removed (web app handles post storage now)
   - auto_save_telegram_id() → removed (handled in save_profile_to_supabase)
   - trigger_heygen_pipeline() → now posts to Supabase webhook edge function
-  - Everythiyng else (interview, post gen, news selection, draft editing) unchanged
+  - Everything else (interview, post gen, news selection, draft editing) unchanged
 """
 
 import asyncio
@@ -18,7 +18,8 @@ import json
 import os
 import random
 import re
-from datetime import datetime
+import uuid
+from datetime import datetime, date, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -35,18 +36,21 @@ load_dotenv()
 
 TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY  = os.environ["OPENROUTER_API_KEY"]
-CLAUDE_MODEL        = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
+CLAUDE_MODEL        = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-6")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-# Supabase — replaces Notion
+# Supabase — use service_role server-side so RLS can stay locked.
+# Falls back to anon key during local dev if the service key isn't set.
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
-SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+SUPABASE_KEY      = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"]
 
-# Webhook secret — must match what Supabase edge function expects
-# WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
+# Optional webhook shared secret — the Supabase edge function can verify this header.
+WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 
 ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "")  # your Lovable app URL
+
+MAX_VOICE_BYTES     = 5 * 1024 * 1024   # 5 MB cap on voice-note downloads
 
 USE_VOICE = False
 el        = None
@@ -64,18 +68,47 @@ if ELEVENLABS_API_KEY:
 
 def _sb_headers() -> dict:
     return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
 
 def _webhook_headers() -> dict:
-    return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
+    if WEBHOOK_SECRET:
+        h["x-webhook-secret"] = WEBHOOK_SECRET
+    return h
+
+
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+async def _post_with_retry(
+    client: httpx.AsyncClient, url: str, *, headers: dict, json_body: dict,
+    attempts: int = 3, label: str = "http",
+) -> httpx.Response:
+    """POST with exponential backoff (1s, 2s, 4s) on transient failures."""
+    delay = 1.0
+    last_exc: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            r = await client.post(url, headers=headers, json=json_body)
+            if r.status_code not in _RETRYABLE_STATUS:
+                return r
+            print(f"[retry] {label} attempt {i}/{attempts} got {r.status_code} — retrying in {delay}s")
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+            print(f"[retry] {label} attempt {i}/{attempts} failed ({e.__class__.__name__}) — retrying in {delay}s")
+        if i < attempts:
+            await asyncio.sleep(delay)
+            delay *= 2
+    if last_exc:
+        raise last_exc
+    return r  # last response with retryable status — let caller handle
 
 
 async def save_profile_to_supabase(name: str, profile: dict, transcript: list, uid: int) -> str:
@@ -143,27 +176,27 @@ async def save_profile_to_supabase(name: str, profile: dict, transcript: list, u
         return ""
 
 
-def get_founder_profile_from_supabase(uid: int) -> dict:
+async def get_founder_profile_from_supabase(uid: int) -> dict:
     """
     Read founder profile from Supabase by telegram_id.
-    Returns { name, page_id, profile_text, tov_json }
-    Synchronous wrapper — uses httpx sync client so it can be called from sync context.
+    Returns { name, page_id, profile_text, tov_json }.
+    Async so it never blocks the Telegram event loop.
     """
+    empty = {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
     try:
-        import httpx as _httpx
-        r = _httpx.get(
-            f"{SUPABASE_URL}/rest/v1/founders",
-            params={"telegram_id": f"eq.{uid}", "select": "*", "limit": "1"},
-            headers=_sb_headers(),
-            timeout=10,
-        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/founders",
+                params={"telegram_id": f"eq.{uid}", "select": "*", "limit": "1"},
+                headers=_sb_headers(),
+            )
         if r.status_code != 200:
             print(f"[Supabase] Profile read failed: {r.status_code}")
-            return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+            return empty
 
         rows = r.json()
         if not rows:
-            return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+            return empty
 
         row = rows[0]
         profile_json = row.get("profile_json") or {}
@@ -177,27 +210,31 @@ def get_founder_profile_from_supabase(uid: int) -> dict:
         }
     except Exception as e:
         print(f"[Supabase] Profile read error: {e}")
-        return {"name": "Founder", "page_id": None, "profile_text": "", "tov_json": {}}
+        return empty
 
 
-async def trigger_video_pipeline(payload: dict):
+async def trigger_video_pipeline(payload: dict) -> bool:
     """
     POST approved post to Supabase webhook edge function.
-    The edge function saves the post and auto-triggers video generation.
+    Returns True on success so the caller can decide whether to delete the draft.
     """
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await _post_with_retry(
+                client,
                 f"{SUPABASE_URL}/functions/v1/webhook-post-approved",
-                json=payload,
                 headers=_webhook_headers(),
+                json_body=payload,
+                label="webhook-post-approved",
             )
         if r.status_code in (200, 201, 202):
             print(f"[Webhook] Post sent ✓ for {payload.get('founder_name')}")
-        else:
-            print(f"[Webhook] Failed: {r.status_code} {r.text[:120]}")
+            return True
+        print(f"[Webhook] Failed: {r.status_code} {r.text[:120]}")
+        return False
     except Exception as e:
         print(f"[Webhook] Error: {e}")
+        return False
 
 
 async def log_to_supabase(telegram_id: str, event_type: str, message: str, payload: dict = None):
@@ -285,15 +322,16 @@ async def delete_draft(uid: int):
 
 
 async def get_today_digest(uid: int) -> dict:
-    """Latest digest row for this founder — returns {news_items, business_ideas}."""
+    """Today's digest row only — returns {news_items, business_ideas}."""
+    today = date.today().isoformat()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 f"{SUPABASE_URL}/rest/v1/daily_digests",
                 params={
                     "telegram_id": f"eq.{uid}",
+                    "sent_date":   f"eq.{today}",
                     "select":      "news_items,business_ideas",
-                    "order":       "sent_date.desc",
                     "limit":       "1",
                 },
                 headers=_sb_headers(),
@@ -332,7 +370,7 @@ FOUNDER VOICE — COMMANDS
 /status   — What's happening right now
 /profile  — See your personality & writing profile
 /draft    — View draft or today's content ideas
-/approve  — Save draft to Notion
+/approve  — Save draft and trigger video
 /next     — Get a completely different version
 /shorter  — Cut the draft down
 /longer   — Add more depth
@@ -350,35 +388,43 @@ Pick a number → send your take (voice or text)
 → get your LinkedIn draft in seconds
 → APPROVE to save, or give feedback to refine"""
 
-def draft_keyboard() -> InlineKeyboardMarkup:
+def draft_keyboard(version: int = 1) -> InlineKeyboardMarkup:
+    """Each button encodes the draft version it was shown for, so taps on
+    stale messages can be rejected in handle_callback (H5)."""
+    def cb(action: str) -> str:
+        return f"{action}:v{version}"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Approve",  callback_data="APPROVE"),
-            InlineKeyboardButton("⏭ Next",     callback_data="NEXT"),
+            InlineKeyboardButton("✅ Approve",  callback_data=cb("APPROVE")),
+            InlineKeyboardButton("⏭ Next",     callback_data=cb("NEXT")),
         ],
         [
-            InlineKeyboardButton("✂️ Shorter",  callback_data="SHORTER"),
-            InlineKeyboardButton("📝 Longer",   callback_data="LONGER"),
-            InlineKeyboardButton("⏩ Skip",     callback_data="SKIP"),
+            InlineKeyboardButton("✂️ Shorter",  callback_data=cb("SHORTER")),
+            InlineKeyboardButton("📝 Longer",   callback_data=cb("LONGER")),
+            InlineKeyboardButton("⏩ Skip",     callback_data=cb("SKIP")),
         ],
     ])
 
 # ── ElevenLabs voice ──────────────────────────────────────────────────────────
+
+def _tts_sync(text: str) -> bytes:
+    audio = el.text_to_speech.convert(
+        voice_id=ELEVENLABS_VOICE_ID,
+        text=text,
+        model_id="eleven_multilingual_v2",
+    )
+    buf = io.BytesIO()
+    for chunk in audio:
+        buf.write(chunk)
+    return buf.getvalue()
+
 
 async def tts(text: str) -> bytes | None:
     global USE_VOICE
     if not USE_VOICE or not el:
         return None
     try:
-        audio = el.text_to_speech.convert(
-            voice_id=ELEVENLABS_VOICE_ID,
-            text=text,
-            model_id="eleven_multilingual_v2",
-        )
-        buf = io.BytesIO()
-        for chunk in audio:
-            buf.write(chunk)
-        return buf.getvalue()
+        return await asyncio.to_thread(_tts_sync, text)
     except Exception as e:
         err = str(e)
         if "voice_not_found" in err or "404" in err:
@@ -389,13 +435,17 @@ async def tts(text: str) -> bytes | None:
         return None
 
 
+def _stt_sync(ogg: bytes) -> str:
+    buf      = io.BytesIO(ogg)
+    buf.name = "audio.ogg"
+    return el.speech_to_text.convert(file=buf, model_id="scribe_v1").text.strip()
+
+
 async def stt(ogg: bytes) -> str | None:
     if not USE_VOICE or not el:
         return None
     try:
-        buf      = io.BytesIO(ogg)
-        buf.name = "audio.ogg"
-        return el.speech_to_text.convert(file=buf, model_id="scribe_v1").text.strip()
+        return await asyncio.to_thread(_stt_sync, ogg)
     except Exception as e:
         print(f"[STT] {e}")
         return None
@@ -404,15 +454,16 @@ async def stt(ogg: bytes) -> str | None:
 
 async def call_claude(messages: list, system: str = None, max_tokens: int = 1500) -> str:
     msgs = [{"role": "system", "content": system}, *messages] if system else messages
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://founderbot.app",
+        "X-Title": "Founder Bot",
+    }
+    body = {"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": msgs}
     async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": "https://founderbot.app",
-                "X-Title": "Founder Bot",
-            },
-            json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": msgs},
+        r = await _post_with_retry(
+            c, "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers, json_body=body, label="call_claude",
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
@@ -445,7 +496,7 @@ async def generate_post(
     is_business_idea: bool = False,
 ) -> tuple[str, dict]:
     # ← CHANGED: reads from Supabase instead of Notion
-    profile = get_founder_profile_from_supabase(uid)
+    profile = await get_founder_profile_from_supabase(uid)
     name    = profile["name"]
     tov_ins = _build_tov_instruction(profile["tov_json"])
 
@@ -805,15 +856,17 @@ async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
         f"YOUR LINKEDIN POST  v1\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{post_text}",
-        reply_markup=draft_keyboard(),
+        reply_markup=draft_keyboard(version=1),
         label="founder_idea post",
     )
     return True
 
 
 def _is_off_topic(text: str) -> bool:
-    """Return True if text looks like a general-purpose LLM query, not a post-edit instruction."""
-    lower = text.lower()
+    """Return True if text looks like a general-purpose LLM query, not a post-edit instruction.
+    Scoped to the first 30 chars so phrases like 'explain my angle more' (legit edit)
+    don't get rejected as off-topic."""
+    lower = text.lower()[:30]
     return any(re.search(pat, lower) for pat in OFF_TOPIC_PATTERNS)
 
 
@@ -834,28 +887,33 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
 
     is_biz = draft.get("is_business_idea", False)
 
-    # APPROVE — ← CHANGED: fires to Supabase webhook instead of Notion + n8n
+    # APPROVE — blocks on the webhook so we only delete the draft once the post is saved.
     if cmd in ("APPROVE", "/APPROVE"):
-        try:
-            asyncio.create_task(trigger_video_pipeline({
-                "founder_name":   draft.get("founder_name", ""),
-                "founder_id":     uid,              # telegram_id
-                "post_text":      draft.get("current_draft", ""),
-                "news_topic":     draft.get("news_topic", ""),
-                "notion_page_id": draft.get("page_id", ""),  # kept for reference
-                "approved_at":    datetime.utcnow().isoformat(),
-            }))
-            approval_msg = (
-                "Your post is saved! 🎉\n"
-                "We're creating your video — you'll get a notification when it's ready.\n"
-                "Keep crushing it. 💪"
+        await update.message.reply_text("Saving your post...")
+        payload = {
+            "idempotency_key": str(uuid.uuid4()),
+            "founder_name":    draft.get("founder_name", ""),
+            "founder_id":      uid,              # telegram_id
+            "post_text":       draft.get("current_draft", ""),
+            "news_topic":      draft.get("news_topic", ""),
+            "founder_page_id": draft.get("page_id", ""),
+            "approved_at":     datetime.now(timezone.utc).isoformat(),
+        }
+        ok = await trigger_video_pipeline(payload)
+        if not ok:
+            await update.message.reply_text(
+                "Couldn't save your post right now — the draft is still here. Tap ✅ Approve again in a moment."
             )
-            if ADMIN_DASHBOARD_URL:
-                approval_msg += f"\n\nSent you video soon"
-            await update.message.reply_text(approval_msg)
-        except Exception as e:
-            await update.message.reply_text(f"Approved! (Error: {str(e)[:80]})")
+            return True
 
+        approval_msg = (
+            "Your post is saved! 🎉\n"
+            "We're creating your video — you'll get a notification when it's ready.\n"
+            "Keep crushing it. 💪"
+        )
+        if ADMIN_DASHBOARD_URL:
+            approval_msg += f"\n\nDashboard: {ADMIN_DASHBOARD_URL}"
+        await update.message.reply_text(approval_msg)
         await delete_draft(uid)
         return True
 
@@ -883,7 +941,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
         draft["current_draft"] = new_post
         draft["version"]       = draft.get("version", 1) + 1
         await save_draft(uid, draft)
-        await update.message.reply_text(_draft_msg("NEW VERSION", new_post, draft["version"]), reply_markup=draft_keyboard())
+        await update.message.reply_text(_draft_msg("NEW VERSION", new_post, draft["version"]), reply_markup=draft_keyboard(draft["version"]))
         return True
 
     # SHORTER
@@ -900,8 +958,9 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
+        draft["version"]       = draft.get("version", 1) + 1
         await save_draft(uid, draft)
-        await update.message.reply_text(_draft_msg("SHORTER", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
+        await update.message.reply_text(_draft_msg("SHORTER", new_post, draft["version"]), reply_markup=draft_keyboard(draft["version"]))
         return True
 
     # LONGER
@@ -918,8 +977,9 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
+        draft["version"]       = draft.get("version", 1) + 1
         await save_draft(uid, draft)
-        await update.message.reply_text(_draft_msg("EXPANDED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
+        await update.message.reply_text(_draft_msg("EXPANDED", new_post, draft["version"]), reply_markup=draft_keyboard(draft["version"]))
         return True
 
     # Free text edit
@@ -940,8 +1000,9 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
+        draft["version"]       = draft.get("version", 1) + 1
         await save_draft(uid, draft)
-        await update.message.reply_text(_draft_msg("EDITED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
+        await update.message.reply_text(_draft_msg("EDITED", new_post, draft["version"]), reply_markup=draft_keyboard(draft["version"]))
         return True
 
     return False
@@ -951,13 +1012,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid  = query.from_user.id
-    data = query.data
+    data = query.data or ""
+
+    # callback_data is "ACTION:vN" — parse and reject if the stored draft has moved on.
+    action, _, vtag = data.partition(":")
+    clicked_version = int(vtag[1:]) if vtag.startswith("v") and vtag[1:].isdigit() else 0
+
+    if clicked_version:
+        draft = await get_draft(uid)
+        current_version = (draft or {}).get("version", 0)
+        if current_version and current_version != clicked_version:
+            await query.message.reply_text(
+                "That's an older version — scroll down to the latest draft and use those buttons."
+            )
+            return
 
     class _FakeUpdate:
         message = query.message
         effective_user = query.from_user
 
-    await handle_draft_reply(_FakeUpdate(), uid, data)
+    await handle_draft_reply(_FakeUpdate(), uid, action)
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -990,9 +1064,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "Founder"
 
     # Check if profile already exists in Supabase
-    profile = get_founder_profile_from_supabase(uid)
+    profile = await get_founder_profile_from_supabase(uid)
     if profile["profile_text"]:
         await update.message.reply_text(RETURNING_WELCOME.format(name=profile['name']))
+        return
+
+    existing = sessions.get(uid)
+    if existing and not existing.get("done"):
+        await update.message.reply_text(
+            "You've got an interview in progress — keep answering, or send /reset to start fresh."
+        )
         return
 
     sessions[uid] = {
@@ -1027,7 +1108,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Topic: {draft.get('news_topic', '')[:60]}\n\n"
             f"APPROVE / NEXT / SHORTER / LONGER\nor send feedback as text.",
-            reply_markup=draft_keyboard(),
+            reply_markup=draft_keyboard(draft.get("version", 1)),
         )
     elif sel and sel.get("waiting_for_idea"):
         await update.message.reply_text(
@@ -1066,7 +1147,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_chat_action("typing")
     # ← CHANGED: reads from Supabase
-    profile = get_founder_profile_from_supabase(uid)
+    profile = await get_founder_profile_from_supabase(uid)
     if not profile["profile_text"]:
         await update.message.reply_text("No profile found. Send /start to create yours.")
         return
@@ -1087,7 +1168,7 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Topic: {draft.get('news_topic', '')}\n\n"
             f"{draft.get('current_draft', '')}",
-            reply_markup=draft_keyboard(),
+            reply_markup=draft_keyboard(ver),
         )
         return
 
@@ -1134,7 +1215,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎙 Voice notes require ElevenLabs. Please type your message.")
         return
 
-    ogg  = bytes(await (await update.message.voice.get_file()).download_as_bytearray())
+    voice = update.message.voice
+    if voice and voice.file_size and voice.file_size > MAX_VOICE_BYTES:
+        await update.message.reply_text(
+            "🎙 That voice note is too long — please keep it under 5 MB (~3 min) or send text."
+        )
+        return
+
+    ogg  = bytes(await (await voice.get_file()).download_as_bytearray())
     text = await stt(ogg)
 
     if not text:
