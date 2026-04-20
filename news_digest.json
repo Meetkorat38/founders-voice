@@ -1,77 +1,56 @@
 {
   "5198041379": {
     "founder_name": "Meet",
-    "sent_at": "2026-04-15T11:04:08.307474+00:00",
+    "sent_at": "2026-04-20T09:02:55.005177+00:00",
     "news_items": [
       {
         "number": 1,
-        "headline": "Thar-Driving Youths Create Chaos in Greater Noida West",
-        "summary": "A viral video from Greater Noida West shows a group of youths in a Thar vehicle blocking streets and causing mayhem, with reports of vehicles burning and rising tensions. The incident has sparked outrage on social media about lawlessness and aggressive driving culture among youth in NCR areas.",
-        "source_url": "https://www.instagram.com/p/DXFHUEkgcXV/",
+        "headline": "Iranian Gunboats Fire at Indian Oil Tanker in Strait of Hormuz",
+        "summary": "An Indian-flagged oil tanker reportedly came under attack by Iranian gunboats in the Strait of Hormuz in the past 24-48 hours, forcing the vessel to take evasive action. Indians across social media are reacting with concern about maritime security, potential economic impacts on oil supplies, and what this means for India's diplomatic position amid rising Middle East tensions.",
+        "source_url": "https://www.instagram.com/reel/DXT9hp4Db0x/",
         "type": "viral"
       },
       {
         "number": 2,
-        "headline": "TCS Nashik Workplace Harassment Allegations Go Viral",
-        "summary": "Multiple complaints have emerged alleging harassment, pressure, and misuse of authority at TCS's Nashik office, sparking serious questions across Indian social media. The case is generating widespread debate about workplace culture in India's IT giants and employee protection.",
-        "source_url": "https://x.com/india_out_loud",
+        "headline": "Indian Man's Racist Treatment in Thailand Goes Viral",
+        "summary": "A disturbing video showing an Indian traveler allegedly facing racist abuse from a Thai woman in Thailand has sparked widespread outrage across Indian social media platforms. The incident has triggered heated debates about how Indians are treated abroad, discrimination against Indian tourists, and calls for stronger diplomatic responses to protect Indian citizens overseas.",
+        "source_url": "https://www.facebook.com/Timesnow/posts/a-disturbing-video-is-going-viral-on-social-media-in-which-an-indian-man-claims-/1455168856654372/",
         "type": "viral"
       },
       {
         "number": 3,
-        "headline": "Government Accused of Targeting Anti-BJP Social Media Accounts",
-        "summary": "Social media users are accusing the Indian government of deliberately suspending or withholding accounts that criticize the BJP and Prime Minister Modi. The allegations have triggered a heated debate about free speech, censorship, and political bias in India's digital space.",
-        "source_url": "https://www.instagram.com/p/DXHKHx-GLzc/",
+        "headline": "India Drops to 6th Largest Economy, Overtaken by UK",
+        "summary": "New IMF 2026 nominal GDP projections show India has officially slipped from 4th to 6th position in global economy rankings, with the UK moving ahead. Indians are debating the implications on social media, with discussions ranging from questioning economic policies to defending India's growth trajectory and arguing over whether nominal GDP rankings truly reflect economic strength.",
+        "source_url": "https://www.instagram.com/reel/DXRQp0JArlW/",
         "type": "viral"
       },
       {
         "number": 4,
-        "headline": "Consulting reports commoditized: $250K work now $250 via AI platform",
-        "summary": "Direct threat to professional services pricing\u2014shows how AI is disrupting traditional consulting deliverables and client expectations on cost.",
-        "source_url": "https://www.linkedin.com/posts/mandaviya-raj_a-250000-consulting-report-now-costs-250-activity-7448220746100961281-HJVT",
+        "headline": "India leads global AI adoption with 92% of workers using AI tools weekly - BCG 2025 survey",
+        "summary": "Professional service businesses must now integrate AI into client conversion systems as the competitive baseline has shifted dramatically with mass adoption.",
+        "source_url": "https://www.facebook.com/TheNationThailand/posts/india-has-become-number-one-in-the-world-in-the-full-scale-use-of-artificial-int/1388255706661093/",
         "type": "niche"
       },
       {
         "number": 5,
-        "headline": "2026 consulting trends emerging for firms and startups",
-        "summary": "Timely industry overview of what's shifting in consulting sector\u2014critical for staying ahead of competitive moves and client expectations.",
-        "source_url": "https://www.facebook.com/groups/americanbigbusiness/posts/35378137485133506/",
-        "type": "niche"
-      },
-      {
-        "number": 6,
-        "headline": "AI-driven systems cutting inventory costs 30-50% with measurable ROI",
-        "summary": "Real data on AI implementation results\u2014perfect case study material for data-driven conversion conversations with skeptical service business owners.",
-        "source_url": "https://www.linkedin.com/posts/neha-mavani-41a653b_ai-marketresearch-b2bsales-activity-7447508071343345664-hAJt",
-        "type": "niche"
-      },
-      {
-        "number": 7,
-        "headline": "Indian startup funding up 25% in Q1 2026, fintech and healthtech leading",
-        "summary": "Market confidence returning means more professional service businesses have budget to invest in conversion systems\u2014timing matters for outreach.",
-        "source_url": "https://www.linkedin.com/posts/isr-editorial-277b141a7_india-startup-review-latest-indian-based-activity-7447483326568824832-A_56",
-        "type": "niche"
-      },
-      {
-        "number": 8,
-        "headline": "India's data centre market doubling to $22B by 2030",
-        "summary": "Infrastructure growth signals broader digital transformation adoption\u2014professional services will need systematic client acquisition as competition intensifies.",
-        "source_url": "https://www.instagram.com/p/DXEZYr_EiV7/",
+        "headline": "India's AI search trends show 235M monthly searches with 154% YOY growth in 2025",
+        "summary": "This massive search volume growth signals professional service buyers are actively researching AI-enhanced solutions, creating immediate opportunity for data-driven positioning.",
+        "source_url": "https://www.linkedin.com/posts/ankurd_artificialintelligence-aiinmarketing-marketingstrategy-activity-7450409160304656385-u873",
         "type": "niche"
       }
     ],
     "business_ideas": [
       {
-        "number": 9,
-        "headline": "I tracked 847 sales calls. 73% failed at the same exact moment.",
+        "number": 6,
+        "headline": "Most consultants track conversion rates. I track the exact moment trust breaks in a sales conversation.",
         "category": "Insight",
-        "why": "Data-driven revelation that promises to identify the exact conversion breaking point their audience is experiencing"
+        "why": "Targets their pain point directly while positioning the founder's data-driven but human approach to solving conversion problems"
       },
       {
-        "number": 10,
-        "headline": "Most consultants overcomplicate their sales process. I removed 4 steps and doubled our close rate.",
-        "category": "Contrarian",
-        "why": "Challenges the common belief that more touchpoints equal more sales while offering proof through simplicity"
+        "number": 7,
+        "headline": "I lost a $50K client because my process was too complicated. Now my clients close deals with a 3-step system.",
+        "category": "Lesson",
+        "why": "Demonstrates credibility through personal failure and offers proof of their systematic simplicity approach that solves the exact problem their audience faces"
       }
     ]
   },

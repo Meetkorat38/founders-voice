@@ -1,1 +1,10 @@
 .env
+
+# legacy local state — now in Supabase tables (pending_drafts, daily_digests)
+pending_drafts.json
+news_digest.json
+
+# python
+__pycache__/
+*.pyc
+.venv/

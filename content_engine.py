@@ -19,7 +19,6 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -35,8 +34,6 @@ SUPABASE_ANON_KEY  = os.environ["SUPABASE_ANON_KEY"]
 CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
 
 firecrawl = Firecrawl(api_key=FIRECRAWL_API_KEY)
-
-NEWS_DIGEST_FILE   = "news_digest.json"
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
@@ -500,32 +497,38 @@ async def send_telegram(chat_id: str, text: str):
 def write_news_digest(telegram_id: str, founder_name: str,
                       news_items: list[dict], business_ideas: list[dict]):
     """
-    Writes flat list of news_items (viral + niche) + business_ideas.
-    bot.py reads this file to know what was sent this morning.
-    Schema matches what bot.py expects: news_items[] + business_ideas[].
+    Upsert today's digest into Supabase `daily_digests` table.
+    bot.py reads the latest row when a founder picks a topic number.
+    Re-running the cron for the same day overwrites that day's row (idempotent per day).
     """
-    try:
-        existing = {}
-        if Path(NEWS_DIGEST_FILE).exists():
-            with open(NEWS_DIGEST_FILE, "r") as f:
-                existing = json.load(f)
-    except Exception:
-        existing = {}
-
-    existing[str(telegram_id)] = {
+    today = datetime.now(timezone.utc).date().isoformat()
+    payload = {
+        "telegram_id":    str(telegram_id),
+        "sent_date":      today,
         "founder_name":   founder_name,
-        "sent_at":        datetime.now(timezone.utc).isoformat(),
         "news_items":     news_items,
         "business_ideas": business_ideas,
     }
+    headers = {**_sb_headers(), "Prefer": "resolution=merge-duplicates"}
 
-    with open(NEWS_DIGEST_FILE, "w") as f:
-        json.dump(existing, f, indent=2)
+    try:
+        r = httpx.post(
+            f"{SUPABASE_URL}/rest/v1/daily_digests",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if r.status_code not in (200, 201):
+            print(f"[Digest] Save failed for {founder_name}: {r.status_code} {r.text[:120]}")
+            return
+    except Exception as e:
+        print(f"[Digest] Save error for {founder_name}: {e}")
+        return
 
     viral_count = len([n for n in news_items if n.get("type") == "viral"])
     niche_count = len([n for n in news_items if n.get("type") == "niche"])
     url_count   = len([n for n in news_items if n.get("source_url")])
-    print(f"[Digest] Written for {founder_name}: "
+    print(f"[Digest] Saved for {founder_name}: "
           f"{viral_count} viral + {niche_count} niche ({url_count} with URLs) + {len(business_ideas)} ideas")
 
 # ── Main ──────────────────────────────────────────────────────────────────────

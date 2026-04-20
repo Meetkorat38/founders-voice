@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile bot.py)",
+      "Bash(python -m py_compile content_engine.py)"
+    ]
+  }
+}

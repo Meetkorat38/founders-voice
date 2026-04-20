@@ -19,7 +19,6 @@ import os
 import random
 import re
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -48,9 +47,6 @@ SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 # WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 
 ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "")  # your Lovable app URL
-
-NEWS_DIGEST_FILE = "news_digest.json"
-PENDING_FILE     = "pending_drafts.json"
 
 USE_VOICE = False
 el        = None
@@ -222,10 +218,95 @@ async def log_to_supabase(telegram_id: str, event_type: str, message: str, paylo
         pass  # logs are best-effort, never block main flow
 
 # ── State ─────────────────────────────────────────────────────────────────────
+# Drafts + digests live in Supabase (see supabase/migrations/0001_drafts_and_digests.sql).
+# Sessions and news_selections stay in-memory — they're short-lived and lost on restart.
 
 sessions:        dict[int, dict] = {}
-pending_drafts:  dict[int, dict] = {}
 news_selections: dict[int, dict] = {}
+
+
+async def get_draft(uid: int) -> dict | None:
+    """Read the pending draft for this founder from Supabase, or None."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/pending_drafts",
+                params={"telegram_id": f"eq.{uid}", "select": "*", "limit": "1"},
+                headers=_sb_headers(),
+            )
+        if r.status_code == 200:
+            rows = r.json()
+            return rows[0] if rows else None
+        print(f"[Draft] Read failed: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"[Draft] Read error: {e}")
+    return None
+
+
+async def save_draft(uid: int, draft: dict):
+    """Upsert the draft row keyed by telegram_id."""
+    payload = {
+        "telegram_id":      str(uid),
+        "founder_name":     draft.get("founder_name", ""),
+        "page_id":          draft.get("page_id"),
+        "news_topic":       draft.get("news_topic", ""),
+        "founder_idea":     draft.get("founder_idea", ""),
+        "current_draft":    draft.get("current_draft", ""),
+        "is_business_idea": draft.get("is_business_idea", False),
+        "version":          draft.get("version", 1),
+    }
+    headers = {**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/pending_drafts",
+                json=payload,
+                headers=headers,
+            )
+        if r.status_code not in (200, 201):
+            print(f"[Draft] Save failed: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"[Draft] Save error: {e}")
+
+
+async def delete_draft(uid: int):
+    """Delete the draft row for this founder (after APPROVE or SKIP)."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.delete(
+                f"{SUPABASE_URL}/rest/v1/pending_drafts",
+                params={"telegram_id": f"eq.{uid}"},
+                headers=_sb_headers(),
+            )
+        if r.status_code not in (200, 204):
+            print(f"[Draft] Delete failed: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"[Draft] Delete error: {e}")
+
+
+async def get_today_digest(uid: int) -> dict:
+    """Latest digest row for this founder — returns {news_items, business_ideas}."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/daily_digests",
+                params={
+                    "telegram_id": f"eq.{uid}",
+                    "select":      "news_items,business_ideas",
+                    "order":       "sent_date.desc",
+                    "limit":       "1",
+                },
+                headers=_sb_headers(),
+            )
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            return {
+                "news_items":     row.get("news_items") or [],
+                "business_ideas": row.get("business_ideas") or [],
+            }
+    except Exception as e:
+        print(f"[Digest] Read error: {e}")
+    return {"news_items": [], "business_ideas": []}
 
 # ── Telegram command menu ─────────────────────────────────────────────────────
 
@@ -268,61 +349,6 @@ HOW IT WORKS EACH MORNING
 Pick a number → send your take (voice or text)
 → get your LinkedIn draft in seconds
 → APPROVE to save, or give feedback to refine"""
-
-# ── File helpers ──────────────────────────────────────────────────────────────
-
-def load_pending():
-    global pending_drafts
-    if Path(PENDING_FILE).exists():
-        try:
-            with open(PENDING_FILE, "r") as f:
-                data = json.load(f)
-            pending_drafts = {int(k): v for k, v in data.items()}
-        except Exception as e:
-            print(f"[Drafts] Load error: {e}")
-
-
-def save_pending():
-    try:
-        with open(PENDING_FILE, "w") as f:
-            json.dump({str(k): v for k, v in pending_drafts.items()}, f, indent=2)
-    except Exception as e:
-        print(f"[Drafts] Save error: {e}")
-
-
-def get_draft(uid: int) -> dict | None:
-    return pending_drafts.get(uid)
-
-
-def clear_draft(uid: int):
-    pending_drafts.pop(uid, None)
-    save_pending()
-
-
-def get_today_digest(uid: int) -> dict:
-    if not Path(NEWS_DIGEST_FILE).exists():
-        return {"news_items": [], "business_ideas": []}
-    try:
-        with open(NEWS_DIGEST_FILE, "r") as f:
-            data = json.load(f)
-        entry = data.get(str(uid), {})
-        # Merge viral (1-3) + niche (4-8) into a single flat list
-        # so all existing callers (handle_news_selection, cmd_draft, etc.) work unchanged
-        viral    = entry.get("viral_items", [])
-        niche    = entry.get("news_items", [])
-        combined = viral + niche
-        return {
-            "news_items":     combined,
-            "business_ideas": entry.get("business_ideas", []),
-        }
-    except Exception as e:
-        print(f"[Digest] Failed to parse {NEWS_DIGEST_FILE}: {e}")
-        return {"news_items": [], "business_ideas": []}
-
-
-def get_today_news(uid: int) -> list[dict]:
-    return get_today_digest(uid)["news_items"]
-
 
 def draft_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -685,7 +711,7 @@ async def handle_news_selection(update: Update, uid: int, text: str) -> bool:
     if not re.match(r'^\d+$', text.strip()):
         return False
 
-    digest     = get_today_digest(uid)
+    digest     = await get_today_digest(uid)
     news_items = digest["news_items"]
     biz_ideas  = digest["business_ideas"]
     total      = len(news_items) + len(biz_ideas)
@@ -761,7 +787,7 @@ async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
         await update.message.reply_text(f"Generation failed: {str(e)[:100]}\nTry again.")
         return True
 
-    pending_drafts[uid] = {
+    draft = {
         "founder_name":     profile.get("name", ""),
         "page_id":          profile.get("page_id"),
         "news_topic":       news_topic,
@@ -770,7 +796,7 @@ async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
         "is_business_idea": is_business_idea,
         "version":          1,
     }
-    save_pending()
+    await save_draft(uid, draft)
     news_selections.pop(uid, None)
 
     await _send_with_retry(
@@ -792,7 +818,7 @@ def _is_off_topic(text: str) -> bool:
 
 
 async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
-    draft = get_draft(uid)
+    draft = await get_draft(uid)
     if not draft:
         return False
 
@@ -830,12 +856,12 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
         except Exception as e:
             await update.message.reply_text(f"Approved! (Error: {str(e)[:80]})")
 
-        clear_draft(uid)
+        await delete_draft(uid)
         return True
 
     # SKIP
     if cmd in ("SKIP", "/SKIP"):
-        clear_draft(uid)
+        await delete_draft(uid)
         await update.message.reply_text(
             "Skipped.\nReply with a different topic number or wait for tomorrow's digest."
         )
@@ -856,8 +882,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             return True
         draft["current_draft"] = new_post
         draft["version"]       = draft.get("version", 1) + 1
-        pending_drafts[uid]    = draft
-        save_pending()
+        await save_draft(uid, draft)
         await update.message.reply_text(_draft_msg("NEW VERSION", new_post, draft["version"]), reply_markup=draft_keyboard())
         return True
 
@@ -875,8 +900,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
-        pending_drafts[uid]    = draft
-        save_pending()
+        await save_draft(uid, draft)
         await update.message.reply_text(_draft_msg("SHORTER", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
         return True
 
@@ -894,8 +918,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
-        pending_drafts[uid]    = draft
-        save_pending()
+        await save_draft(uid, draft)
         await update.message.reply_text(_draft_msg("EXPANDED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
         return True
 
@@ -917,8 +940,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
             await update.message.reply_text(f"Error: {str(e)[:80]}")
             return True
         draft["current_draft"] = new_post
-        pending_drafts[uid]    = draft
-        save_pending()
+        await save_draft(uid, draft)
         await update.message.reply_text(_draft_msg("EDITED", new_post, draft.get("version", 1)), reply_markup=draft_keyboard())
         return True
 
@@ -992,10 +1014,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid    = update.effective_user.id
-    draft  = get_draft(uid)
+    draft  = await get_draft(uid)
     sel    = news_selections.get(uid)
     sess   = sessions.get(uid)
-    digest = get_today_digest(uid)
+    digest = await get_today_digest(uid)
     all_topics = len(digest["news_items"]) + len(digest["business_ideas"])
 
     if draft:
@@ -1055,7 +1077,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
-    draft = get_draft(uid)
+    draft = await get_draft(uid)
 
     if draft:
         ver = draft.get("version", 1)
@@ -1069,7 +1091,7 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    digest    = get_today_digest(uid)
+    digest    = await get_today_digest(uid)
     news      = digest["news_items"]
     biz_ideas = digest["business_ideas"]
 
@@ -1099,8 +1121,8 @@ async def cmd_longer(update: Update, ctx):  await handle_draft_reply(update, upd
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     sessions.pop(uid, None)
-    clear_draft(uid)
     news_selections.pop(uid, None)
+    await delete_draft(uid)
     await update.message.reply_text("All cleared. Send /start to begin your profile interview.")
 
 
@@ -1142,11 +1164,8 @@ async def route_message(update: Update, uid: int, text: str):
     if uid in sessions and not sessions[uid].get("done"):
         await process_interview(update, uid, text)
         return
-    if uid in pending_drafts:
-        await handle_draft_reply(update, uid, text)
-        return
 
-    digest    = get_today_digest(uid)
+    digest    = await get_today_digest(uid)
     all_count = len(digest["news_items"]) + len(digest["business_ideas"])
     if all_count > 0:
         await update.message.reply_text(
@@ -1168,15 +1187,12 @@ async def post_init(app: Application):
 
 
 def main():
-    load_pending()
-
     print("=" * 48)
     print("  FOUNDER VOICE BOT — SUPABASE EDITION")
     print("=" * 48)
     print(f"  Model     : {CLAUDE_MODEL}")
     print(f"  Voice     : {'ON' if USE_VOICE else 'OFF'}")
     print(f"  Supabase  : {SUPABASE_URL[:40]}...")
-    print(f"  Drafts    : {len(pending_drafts)} pending")
     print("=" * 48)
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
