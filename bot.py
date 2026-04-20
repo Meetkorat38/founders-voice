@@ -9,7 +9,7 @@ Changes from previous version:
   - save_approved_post_to_notion() → removed (web app handles post storage now)
   - auto_save_telegram_id() → removed (handled in save_profile_to_supabase)
   - trigger_heygen_pipeline() → now posts to Supabase webhook edge function
-  - Everything else (interview, post gen, news selection, draft editing) unchanged
+  - Everythiyng else (interview, post gen, news selection, draft editing) unchanged
 """
 
 import asyncio
@@ -399,7 +399,7 @@ def _build_tov_instruction(tov: dict) -> str:
     return (
         f"\nMATCH THEIR EXACT WRITING STYLE:\n"
         f"- Avg sentence: ~{tov.get('avg_sentence_words', tov.get('sentence_length', 'short'))} words\n"
-        f"- Post length: ~{tov.get('avg_post_words', 130)} words\n"
+        f"- Post length: 50-60 words (strict)\n"
         f"- Emojis: {'yes sparingly' if tov.get('uses_emojis') else 'NO emojis'}\n"
         f"- Hashtags: {'yes at end' if tov.get('uses_hashtags') else 'NO hashtags'}\n"
         f"- Bullets: {'yes' if tov.get('uses_bullet_points') or tov.get('uses_bullets') else 'NO bullets'}\n"
@@ -447,6 +447,7 @@ async def generate_post(
             f"CURRENT DRAFT:\n{existing_draft}\n\n"
             f"EDIT: {edit_instruction}\n\n"
             f"Rewrite following the edit. Keep their exact voice.\n"
+            f"HARD LENGTH RULE: The final post MUST be between 50 and 60 words total. Not more, not less. Count carefully.\n"
             f"Output ONLY the post text."
         )
     elif is_business_idea:
@@ -465,6 +466,7 @@ async def generate_post(
             f"- Strong hook on line 1\n"
             f"- Short paragraphs, white space\n"
             f"- End with a thought or question — not a hard sell\n"
+            f"- HARD LENGTH RULE: The post MUST be between 50 and 60 words total. Not more, not less. Count carefully before outputting.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
     else:
@@ -483,6 +485,7 @@ async def generate_post(
             f"- Strong hook on line 1\n"
             f"- Short paragraphs, white space\n"
             f"- End with a thought or question — not a hard sell\n"
+            f"- HARD LENGTH RULE: The post MUST be between 50 and 60 words total. Not more, not less. Count carefully before outputting.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
 
@@ -822,7 +825,7 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
                 "Keep crushing it. 💪"
             )
             if ADMIN_DASHBOARD_URL:
-                approval_msg += f"\n\nTrack it here: {ADMIN_DASHBOARD_URL}"
+                approval_msg += f"\n\nSent you video soon!"
             await update.message.reply_text(approval_msg)
         except Exception as e:
             await update.message.reply_text(f"Approved! (Error: {str(e)[:80]})")
