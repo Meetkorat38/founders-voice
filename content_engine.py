@@ -30,8 +30,9 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 FIRECRAWL_API_KEY  = os.environ["FIRECRAWL_API_KEY"]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 SUPABASE_URL       = os.environ["SUPABASE_URL"]
-# Prefer service_role server-side so RLS can stay locked. Falls back to anon for local dev.
-SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_ANON_KEY"]
+# For Lovable deployments, only anon key is available. Lovable manages Supabase directly.
+# RLS is configured to allow anon read/write on bot tables.
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-6")
 
 # Cap concurrent founder processing so we don't storm Claude / Firecrawl with N parallel requests.
@@ -76,7 +77,7 @@ async def _post_with_retry(
     return r
 
 def get_all_founders() -> list[dict]:
-    print("[Supabase] Loading founders...")
+    print(f"[Supabase] Loading founders...")
     try:
         r = httpx.get(
             f"{SUPABASE_URL}/rest/v1/founders",
@@ -85,9 +86,11 @@ def get_all_founders() -> list[dict]:
             timeout=15,
         )
         if r.status_code != 200:
-            print(f"[Supabase] Failed: {r.status_code} {r.text[:120]}")
+            print(f"[Supabase] Failed: {r.status_code} {r.text[:200]}")
             return []
-        rows     = r.json()
+        rows = r.json()
+        if not rows:
+            print(f"[Supabase] Table returned 0 rows. Check RLS policies allow anon SELECT on founders table.")
         founders = []
         for row in rows:
             name        = row.get("name")

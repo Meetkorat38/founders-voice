@@ -40,10 +40,10 @@ CLAUDE_MODEL        = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4-
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-# Supabase — use service_role server-side so RLS can stay locked.
-# Falls back to anon key during local dev if the service key isn't set.
-SUPABASE_URL      = os.environ["SUPABASE_URL"]
-SUPABASE_KEY      = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"]
+# Supabase — For Lovable deployments, only anon key is available.
+# Lovable manages Supabase directly. RLS is configured to allow anon read/write on bot tables.
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 # Optional webhook shared secret — the Supabase edge function can verify this header.
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
