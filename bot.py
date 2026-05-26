@@ -203,10 +203,14 @@ async def get_founder_profile_from_supabase(uid: int) -> dict:
         tov_json     = profile_json.get("tov", {})
 
         return {
-            "name":         row.get("name", "Founder"),
-            "page_id":      row.get("id"),          # uuid, used as reference
-            "profile_text": row.get("profile_text", ""),
-            "tov_json":     tov_json,
+            "name":          row.get("name", "Founder"),
+            "page_id":       row.get("id"),
+            "profile_text":  row.get("profile_text", ""),
+            "tov_json":      tov_json,
+            "dimensions":    profile_json.get("dimensions", {}),
+            "archetype":     profile_json.get("archetype_blend", {}),
+            "profile_json":  profile_json,
+            "example_posts": row.get("example_posts") or [],
         }
     except Exception as e:
         print(f"[Supabase] Profile read error: {e}")
@@ -260,6 +264,7 @@ async def log_to_supabase(telegram_id: str, event_type: str, message: str, paylo
 
 sessions:        dict[int, dict] = {}
 news_selections: dict[int, dict] = {}
+edit_pending:    dict[int, bool] = {}
 
 
 async def get_draft(uid: int) -> dict | None:
@@ -403,6 +408,9 @@ def draft_keyboard(version: int = 1) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📝 Longer",   callback_data=cb("LONGER")),
             InlineKeyboardButton("⏩ Skip",     callback_data=cb("SKIP")),
         ],
+        [
+            InlineKeyboardButton("✏️ Edit",     callback_data=cb("EDIT")),
+        ],
     ])
 
 # ── ElevenLabs voice ──────────────────────────────────────────────────────────
@@ -475,15 +483,68 @@ def _build_tov_instruction(tov: dict) -> str:
         return ""
     return (
         f"\nMATCH THEIR EXACT WRITING STYLE:\n"
+        f"- Hook style: {tov.get('hook_style', 'natural observation')}\n"
+        f"- CTA style: {tov.get('cta_style', 'open-ended thought')}\n"
         f"- Avg sentence: ~{tov.get('avg_sentence_words', tov.get('sentence_length', 'short'))} words\n"
-        f"- Post length: 50-60 words (strict)\n"
-        f"- Emojis: {'yes sparingly' if tov.get('uses_emojis') else 'NO emojis'}\n"
-        f"- Hashtags: {'yes at end' if tov.get('uses_hashtags') else 'NO hashtags'}\n"
+        f"- NO emojis — this becomes a spoken video script\n"
+        f"- NO hashtags\n"
         f"- Bullets: {'yes' if tov.get('uses_bullet_points') or tov.get('uses_bullets') else 'NO bullets'}\n"
         f"- Line breaks between sentences: yes\n"
-        f"- Power words: {', '.join(tov.get('power_words', [])[:5])}\n"
+        f"- Power words to use: {', '.join(tov.get('power_words', [])[:5])}\n"
         f"- Never: {', '.join(tov.get('what_they_never_do', [])[:3])}\n"
         f"- Vocabulary: {tov.get('vocabulary_level', tov.get('vocabulary', 'conversational'))}\n"
+        f"- Preferred topics: {', '.join(tov.get('topics', [])[:4])}\n"
+    )
+
+
+_ARCHETYPE_TRAITS = {
+    "Naval Ravikant":    "Aphorisms only. One insight per sentence. No filler. Philosophical depth in 8 words. Never explains — lets the idea land.",
+    "Gary Vaynerchuk":   "Raw, punchy, zero corporate polish. Calls out excuses. Street energy. Challenges the reader directly. 'The truth is...'",
+    "Simon Sinek":       "Always starts with WHY. Empathy before data. Builds slowly to an insight that feels earned. Inspires, never instructs.",
+    "Brene Brown":       "Opens with personal vulnerability. One real story, one universal truth. Warm and disarming. Never preachy.",
+    "Balaji Srinivasan": "Data and specifics first. Thesis-driven. Future-focused. References trends with precision. Dense but never academic.",
+    "Oprah Winfrey":     "Conversational and human. Asks questions that make the reader feel seen. Emotional resonance over argument.",
+    "Paul Graham":       "Short paragraphs. Counterintuitive observations. Strips away assumptions. Each sentence earns the next.",
+    "Alex Hormozi":      "Numbered frameworks. 'Here's what nobody tells you.' Contrarian takes backed by specifics. High information density. Actionable above all.",
+    "Sahil Bloom":       "Storytelling-first. Opens with a moment, not a statement. Threads a lesson through narrative. Warm but sharp.",
+    "Justin Welsh":      "Personal, specific, repeatable. Heavy on one-line punches. Always ties back to one clear lesson. Never vague.",
+}
+
+
+def _build_persona_system_prompt(profile: dict) -> str:
+    name     = profile.get("name", "Founder")
+    arch     = profile.get("archetype", {})
+    dims     = profile.get("dimensions", {})
+    biz      = profile.get("profile_json", {}).get("business", {})
+    examples = profile.get("example_posts", [])
+
+    primary         = arch.get("primary", "")
+    secondary       = arch.get("secondary", "")
+    p_weight        = int(float(arch.get("primary_weight", 0)) * 100)
+    s_weight        = int(float(arch.get("secondary_weight", 0)) * 100)
+    primary_trait   = _ARCHETYPE_TRAITS.get(primary, "")
+    secondary_trait = _ARCHETYPE_TRAITS.get(secondary, "")
+
+    top_dims = sorted(dims.items(), key=lambda x: x[1], reverse=True)[:3]
+    dims_str = ", ".join(f"{k.replace('_', ' ')} ({v}/100)" for k, v in top_dims)
+
+    example_block = ""
+    if examples:
+        formatted = "\n\n---\n".join(f'"{p}"' for p in examples[:3])
+        example_block = f"\n\nEXAMPLE POSTS IN THEIR VOICE (study these — match this style exactly):\n{formatted}"
+
+    return (
+        f"You are ghostwriting a LinkedIn post for {name}, founder in {biz.get('industry', 'tech')}.\n"
+        f"They build: {biz.get('what_they_do', '')}.\n"
+        f"Audience: {biz.get('target_audience', '')}.\n"
+        f"Their edge: {biz.get('unique_angle', '')}.\n\n"
+        f"VOICE BLEND:\n"
+        f"  {p_weight}% {primary} — {primary_trait}\n"
+        f"  {s_weight}% {secondary} — {secondary_trait}\n\n"
+        f"PERSONALITY: {dims_str}\n\n"
+        f"IMPORTANT: This post becomes a spoken video script. Write for the ear.\n"
+        f"No emojis. No hashtags. Short sentences with natural spoken rhythm.\n"
+        f"A reader who knows {name} must immediately recognise this as their voice.{example_block}"
     )
 
 
@@ -495,10 +556,10 @@ async def generate_post(
     edit_instruction: str = "",
     is_business_idea: bool = False,
 ) -> tuple[str, dict]:
-    # ← CHANGED: reads from Supabase instead of Notion
     profile = await get_founder_profile_from_supabase(uid)
     name    = profile["name"]
     tov_ins = _build_tov_instruction(profile["tov_json"])
+    system_prompt = _build_persona_system_prompt(profile)
 
     if not profile["profile_text"]:
         try:
@@ -518,20 +579,19 @@ async def generate_post(
     if existing_draft and edit_instruction:
         prompt = (
             f"Ghostwrite a LinkedIn post for {name}.\n\n"
-            f"PROFILE:\n{profile['profile_text'][:2500]}\n{tov_ins}\n"
+            f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"TOPIC: {news_topic}\n"
             f"THEIR IDEA: {founder_idea}\n\n"
             f"CURRENT DRAFT:\n{existing_draft}\n\n"
             f"EDIT: {edit_instruction}\n\n"
             f"Rewrite following the edit. Keep their exact voice.\n"
-            f"HARD LENGTH RULE: The final post MUST be between 50 and 60 words total. Not more, not less. Count carefully.\n"
+            f"HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
             f"Output ONLY the post text."
         )
     elif is_business_idea:
         prompt = (
             f"Ghostwrite a LinkedIn post for {name}.\n\n"
-            f"THEIR PROFILE (personality, archetype, tone of voice):\n"
-            f"{profile['profile_text'][:2500]}\n{tov_ins}\n"
+            f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"CONTENT IDEA: {news_topic}\n\n"
             f"FOUNDER'S ANGLE:\n\"{founder_idea}\"\n\n"
             f"Write a LinkedIn post that:\n"
@@ -543,14 +603,13 @@ async def generate_post(
             f"- Strong hook on line 1\n"
             f"- Short paragraphs, white space\n"
             f"- End with a thought or question — not a hard sell\n"
-            f"- HARD LENGTH RULE: The post MUST be between 50 and 60 words total. Not more, not less. Count carefully before outputting.\n"
+            f"- HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
     else:
         prompt = (
             f"Ghostwrite a LinkedIn post for {name}.\n\n"
-            f"THEIR PROFILE (personality, archetype, tone of voice):\n"
-            f"{profile['profile_text'][:2500]}\n{tov_ins}\n"
+            f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"TODAY'S NEWS HOOK: {news_topic}\n\n"
             f"FOUNDER'S IDEA / ANGLE:\n\"{founder_idea}\"\n\n"
             f"Write a LinkedIn post that:\n"
@@ -562,11 +621,15 @@ async def generate_post(
             f"- Strong hook on line 1\n"
             f"- Short paragraphs, white space\n"
             f"- End with a thought or question — not a hard sell\n"
-            f"- HARD LENGTH RULE: The post MUST be between 50 and 60 words total. Not more, not less. Count carefully before outputting.\n"
+            f"- HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
 
-    post = await call_claude([{"role": "user", "content": prompt}], max_tokens=600)
+    post = await call_claude(
+        [{"role": "user", "content": prompt}],
+        system=system_prompt,
+        max_tokens=700,
+    )
     print(f"[Generate] Done — {len(post)} chars")
     return post, profile
 
@@ -984,7 +1047,8 @@ async def handle_draft_reply(update: Update, uid: int, text: str) -> bool:
 
     # Free text edit
     if len(text.strip()) > 3 and not text.startswith("/"):
-        if _is_off_topic(text):
+        in_edit_mode = edit_pending.pop(uid, False)
+        if not in_edit_mode and _is_off_topic(text):
             await update.message.reply_text(OFF_TOPIC_REPLY)
             return True
         await update.message.reply_chat_action("typing")
@@ -1026,6 +1090,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "That's an older version — scroll down to the latest draft and use those buttons."
             )
             return
+
+    if action == "EDIT":
+        edit_pending[uid] = True
+        await query.message.reply_text(
+            "What would you like to change? Type your edit instruction\n"
+            "(e.g. 'make the opening line stronger' or 'add a personal story'):"
+        )
+        return
 
     class _FakeUpdate:
         message = query.message
