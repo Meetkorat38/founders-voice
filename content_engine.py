@@ -18,7 +18,8 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from dotenv import load_dotenv
@@ -276,30 +277,105 @@ def _number_items(items: list[dict], start_num: int, item_type: str) -> list[dic
         for i, it in enumerate(items)
     ]
 
+# ── Reddit trending helper ────────────────────────────────────────────────────
+
+async def fetch_reddit_trending() -> list[dict]:
+    """
+    Fetch hot posts from Indian subreddits via Reddit's public JSON API.
+    Returns items in the same {title, description, url, markdown, source} format
+    as _firecrawl_search so they can be pooled together.
+    Only external URLs are kept (self-posts and reddit.com links are skipped).
+    """
+    subs = ["india", "bollywood", "Cricket", "IndiaInvestments", "startups"]
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    async with httpx.AsyncClient(
+        timeout=15,
+        headers={"User-Agent": "FoundersVoiceBot/1.0"},
+        follow_redirects=True,
+    ) as client:
+        for sub in subs:
+            try:
+                r = await client.get(f"https://www.reddit.com/r/{sub}/hot.json?limit=5")
+                if r.status_code != 200:
+                    continue
+                posts = r.json().get("data", {}).get("children", [])
+                for p in posts:
+                    d = p.get("data", {})
+                    url = d.get("url", "")
+                    if not url or url in seen_urls or "reddit.com" in url:
+                        continue
+                    seen_urls.add(url)
+                    items.append({
+                        "title":       d.get("title", ""),
+                        "description": (
+                            f"r/{sub} · {d.get('score', 0):,} upvotes · "
+                            f"{d.get('num_comments', 0):,} comments"
+                        ),
+                        "url":      url,
+                        "markdown": d.get("selftext", "")[:300],
+                        "source":   "reddit",
+                    })
+            except Exception as e:
+                print(f"[Reddit] r/{sub} failed: {e}")
+    print(f"[Reddit] → {len(items)} posts with external URLs")
+    return items
+
+
+async def _get_yesterday_viral_headlines() -> list[str]:
+    """
+    Fetch the viral headline text from yesterday's digest (any founder row).
+    Used to tell Claude which stories were already sent so it avoids repeating them.
+    """
+    yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/daily_digests",
+                params={
+                    "sent_date": f"eq.{yesterday}",
+                    "select":    "news_items",
+                    "limit":     "1",
+                },
+                headers=_sb_headers(),
+            )
+        if r.status_code != 200 or not r.json():
+            return []
+        headlines = []
+        for row in r.json():
+            for item in (row.get("news_items") or []):
+                if item.get("type") == "viral" and item.get("headline"):
+                    headlines.append(item["headline"])
+        return headlines
+    except Exception:
+        return []
+
+
 # ── Step 1: Fetch 3 Indian viral stories ─────────────────────────────────────
 
 async def fetch_indian_viral_news() -> list[dict]:
     """
-    Two-pass fetch for top 3 stories viral across India (24-72h).
+    Two-pass fetch for top 3 stories viral across India.
+    Sources: Firecrawl (news/web) + Reddit India hot posts.
+    Cross-day deduplication: yesterday's viral topics are excluded via Claude prompt.
     """
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
     print(f"\n[Viral] Fetching Indian viral news — {today}")
 
-    # Pass 1: cast a WIDE net — run several broad queries and pool results.
-    # We don't bias to any specific category (cricket/bollywood/etc). Claude filters.
+    # Pass 1A: Firecrawl — mix of 24h and 6h windows to get both context and freshness.
     queries = [
-        "top trending news India today",
-        "what Indians are talking about today social media",
-        "most discussed story India past 24 hours",
-        "India trending twitter X today",
+        ("top trending news India today",               "qdr:d"),
+        ("India breaking news viral last 6 hours",      "qdr:6h"),
+        ("most discussed story India past 24 hours",    "qdr:d"),
+        ("India trending viral right now this morning", "qdr:6h"),
     ]
     raw_items: list[dict] = []
     seen_urls: set[str] = set()
-    for q in queries:
+    for q, tbs in queries:
         for item in _firecrawl_search(
             query=q,
             sources=["news", "web"],
-            tbs="qdr:d",
+            tbs=tbs,
             limit=8,
             location="in",
         ):
@@ -308,39 +384,59 @@ async def fetch_indian_viral_news() -> list[dict]:
             seen_urls.add(item["url"])
             raw_items.append(item)
 
+    # Pass 1B: Reddit India — real discussion signal with verified article URLs.
+    reddit_items = await fetch_reddit_trending()
+    for item in reddit_items:
+        if item["url"] not in seen_urls:
+            seen_urls.add(item["url"])
+            raw_items.append(item)
+
     if not raw_items:
-        print(f"[Viral] Empty Firecrawl result")
+        print(f"[Viral] Empty result from all sources")
         return []
-    print(f"[Viral] Pooled {len(raw_items)} unique results across {len(queries)} queries")
+    print(f"[Viral] Pooled {len(raw_items)} unique results across {len(queries)} queries + Reddit")
+
+    # Cross-day dedup: fetch yesterday's viral headlines so Claude avoids repeating them.
+    yesterday_headlines = await _get_yesterday_viral_headlines()
+    if yesterday_headlines:
+        already_sent = "\n".join(f"- {h}" for h in yesterday_headlines)
+        exclusion_clause = (
+            f"\n\nIMPORTANT — these topics were already sent YESTERDAY. "
+            f"Do NOT pick them again unless something genuinely new broke today:\n{already_sent}\n"
+        )
+        print(f"[Viral] Excluding yesterday's topics: {yesterday_headlines}")
+    else:
+        exclusion_clause = ""
 
     # Pass 2: Claude picks the 3 topics actually driving engagement right now.
-    # No category hints — let the data speak.
     system_prompt = (
-        f"Today is {today}. You are given numbered web/news search results from India "
-        "covering the past 24-48 hours.\n\n"
+        f"Today is {today}. You are given numbered results from Indian news sites, "
+        "web pages, and Reddit India discussions from the past 6-48 hours.\n\n"
         "Your job: identify the TOP 3 TOPICS currently driving the MOST conversation "
         "and engagement across Indian social media (Twitter/X India, Instagram, YouTube, "
-        "WhatsApp) right now.\n\n"
+        "WhatsApp, Reddit India) right now.\n\n"
         "A topic qualifies only if ALL are true:\n"
         "1. It broke or peaked in the last 24-48 hours\n"
         "2. Ordinary Indians (not just one industry) are reacting to it\n"
         "3. Posting an opinion about it would get real engagement today\n\n"
+        "Prefer sources with high Reddit engagement (upvotes + comments) as they signal "
+        "genuine discussion, not just publisher promotion.\n\n"
         "Do NOT assume categories. The 3 winners could be anything — policy, sports, "
         "tech layoffs, a celebrity, a startup scandal, a weather event, an economic shift, "
-        "a viral video, whatever is actually dominating feeds. Pick what the DATA shows, "
-        "not what you'd expect.\n\n"
+        "a viral video, whatever is actually dominating feeds. Pick what the DATA shows.\n\n"
         "Reject: evergreen explainers, listicles, pure promo, week-old stories, niche "
         "industry news that only insiders discuss.\n\n"
         "If two results cover the same topic, pick the one with the strongest source and "
-        "merge context — don't return duplicates.\n\n"
-        "Return ONLY a JSON array (no markdown, no backticks):\n"
+        "merge context — don't return duplicates."
+        + exclusion_clause
+        + "\n\nReturn ONLY a JSON array (no markdown, no backticks):\n"
         '[{"index": <int from input>, '
         '"headline": "the specific topic as a headline", '
         '"summary": "two sentences — what happened + why India is reacting / what the debate is"}]'
     )
 
     try:
-        picks = await _claude_pick(raw_items, system_prompt, max_items=3, max_tokens=700)
+        picks = await _claude_pick(raw_items, system_prompt, max_items=2, max_tokens=600)
     except Exception as e:
         print(f"[Viral] Claude picking failed: {e}")
         return []
@@ -392,7 +488,7 @@ async def fetch_niche_news(founder: dict, start_num: int) -> list[dict]:
     )
 
     try:
-        picks = await _claude_pick(raw_items, system_prompt, max_items=5, max_tokens=900)
+        picks = await _claude_pick(raw_items, system_prompt, max_items=2, max_tokens=600)
     except Exception as e:
         print(f"[Niche] Claude picking failed for {name}: {e}")
         return []
@@ -458,7 +554,7 @@ async def generate_content_ideas(founder: dict, start_num: int) -> list[dict]:
         return []
 
     result = []
-    for item in items[:2]:
+    for item in items[:1]:
         result.append({
             "number":   start_num + len(result),
             "headline": item.get("headline", "").strip(),
@@ -529,10 +625,18 @@ def format_digest(founder_name: str, viral_items: list[dict],
 async def send_telegram(chat_id: str, text: str):
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     async with httpx.AsyncClient(timeout=30) as client:
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            payload: dict = {"chat_id": chat_id, "text": chunk}
+            # Attach the "Write your own script" button only to the last chunk
+            if i == len(chunks) - 1:
+                payload["reply_markup"] = {
+                    "inline_keyboard": [[
+                        {"text": "✍️ Write your own script", "callback_data": "CUSTOM_SCRIPT"}
+                    ]]
+                }
             r = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk}
+                json=payload,
             )
             ok = r.status_code == 200
             print(f"[Telegram] → {chat_id}: {'OK' if ok else r.text[:80]}")
@@ -589,6 +693,16 @@ async def run():
     if not founders:
         print("No founders found in Supabase.")
         return
+
+    # Optional: pass a telegram_id as CLI arg to test for one founder only
+    # Usage: python content_engine.py 5198041379
+    if len(sys.argv) > 1:
+        only_id = sys.argv[1]
+        founders = [f for f in founders if str(f["telegram_id"]) == only_id]
+        if not founders:
+            print(f"[Test] No founder found with telegram_id={only_id}")
+            return
+        print(f"[Test] Running for single founder: {founders[0]['name']}")
 
     # Fetch Indian viral news once — same 3 items for ALL founders
     viral_items = await fetch_indian_viral_news()

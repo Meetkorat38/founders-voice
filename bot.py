@@ -262,9 +262,10 @@ async def log_to_supabase(telegram_id: str, event_type: str, message: str, paylo
 # Drafts + digests live in Supabase (see supabase/migrations/0001_drafts_and_digests.sql).
 # Sessions and news_selections stay in-memory — they're short-lived and lost on restart.
 
-sessions:        dict[int, dict] = {}
-news_selections: dict[int, dict] = {}
-edit_pending:    dict[int, bool] = {}
+sessions:               dict[int, dict] = {}
+news_selections:        dict[int, dict] = {}
+edit_pending:           dict[int, bool] = {}
+custom_script_pending:  dict[int, bool] = {}
 
 
 async def get_draft(uid: int) -> dict | None:
@@ -534,7 +535,7 @@ def _build_persona_system_prompt(profile: dict) -> str:
         example_block = f"\n\nEXAMPLE POSTS IN THEIR VOICE (study these — match this style exactly):\n{formatted}"
 
     return (
-        f"You are ghostwriting a LinkedIn post for {name}, founder in {biz.get('industry', 'tech')}.\n"
+        f"You are writing a LinkedIn post IN THE VOICE OF {name}, a founder in {biz.get('industry', 'tech')}.\n"
         f"They build: {biz.get('what_they_do', '')}.\n"
         f"Audience: {biz.get('target_audience', '')}.\n"
         f"Their edge: {biz.get('unique_angle', '')}.\n\n"
@@ -542,8 +543,10 @@ def _build_persona_system_prompt(profile: dict) -> str:
         f"  {p_weight}% {primary} — {primary_trait}\n"
         f"  {s_weight}% {secondary} — {secondary_trait}\n\n"
         f"PERSONALITY: {dims_str}\n\n"
-        f"IMPORTANT: This post becomes a spoken video script. Write for the ear.\n"
-        f"No emojis. No hashtags. Short sentences with natural spoken rhythm.\n"
+        f"GUIDING PRINCIPLE: {name} shares knowledge — they do not sell.\n"
+        f"This post must feel like a founder thinking out loud: a lesson learned, an insight earned, "
+        f"a perspective only they could have. Not a pitch. Not a promo. Pure knowledge-sharing.\n\n"
+        f"Write for the ear — short sentences, natural spoken rhythm, no emojis, no hashtags.\n"
         f"A reader who knows {name} must immediately recognise this as their voice.{example_block}"
     )
 
@@ -578,50 +581,50 @@ async def generate_post(
 
     if existing_draft and edit_instruction:
         prompt = (
-            f"Ghostwrite a LinkedIn post for {name}.\n\n"
+            f"Rewrite the LinkedIn post below IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"TOPIC: {news_topic}\n"
             f"THEIR IDEA: {founder_idea}\n\n"
             f"CURRENT DRAFT:\n{existing_draft}\n\n"
-            f"EDIT: {edit_instruction}\n\n"
-            f"Rewrite following the edit. Keep their exact voice.\n"
-            f"HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
+            f"EDIT INSTRUCTION: {edit_instruction}\n\n"
+            f"Apply the edit. Keep their exact voice. No selling, no CTAs.\n"
+            f"HARD LENGTH RULE: 80-90 words. Spoken video script — 25-30 sec at natural pace.\n"
             f"Output ONLY the post text."
         )
     elif is_business_idea:
         prompt = (
-            f"Ghostwrite a LinkedIn post for {name}.\n\n"
+            f"Write a LinkedIn post IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"CONTENT IDEA: {news_topic}\n\n"
             f"FOUNDER'S ANGLE:\n\"{founder_idea}\"\n\n"
-            f"Write a LinkedIn post that:\n"
+            f"Write a post that:\n"
             f"- Draws from their own business experience and expertise\n"
             f"- Expresses the founder's angle in their own authentic voice\n"
             f"- Sounds like THEM — not generic AI\n"
-            f"- Provides real value to their specific audience\n\n"
+            f"- Teaches, challenges, or shifts how the reader sees something\n\n"
             f"Rules:\n"
-            f"- Strong hook on line 1\n"
+            f"- Strong hook on line 1 — a specific observation, not a question\n"
             f"- Short paragraphs, white space\n"
-            f"- End with a thought or question — not a hard sell\n"
-            f"- HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
+            f"- End with a thought that leaves the reader thinking — no CTA, no sell, no 'DM me'\n"
+            f"- HARD LENGTH RULE: 80-90 words. Spoken video script — 25-30 sec at natural pace.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
     else:
         prompt = (
-            f"Ghostwrite a LinkedIn post for {name}.\n\n"
+            f"Write a LinkedIn post IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
             f"TODAY'S NEWS HOOK: {news_topic}\n\n"
             f"FOUNDER'S IDEA / ANGLE:\n\"{founder_idea}\"\n\n"
-            f"Write a LinkedIn post that:\n"
+            f"Write a post that:\n"
             f"- Uses the news as the hook or context\n"
-            f"- Expresses the founder's idea in their own voice\n"
-            f"- Sounds like THEM — not generic AI\n"
-            f"- Makes their audience stop and read\n\n"
+            f"- Expresses the founder's insight or lesson — what THEY take away from this\n"
+            f"- Sounds like THEM thinking out loud, not a news summary\n"
+            f"- Teaches, challenges, or shifts how the reader sees something\n\n"
             f"Rules:\n"
-            f"- Strong hook on line 1\n"
+            f"- Strong hook on line 1 — a specific observation, not a question\n"
             f"- Short paragraphs, white space\n"
-            f"- End with a thought or question — not a hard sell\n"
-            f"- HARD LENGTH RULE: 80-90 words. This is a spoken video script — 25-30 seconds at natural pace.\n"
+            f"- End with a thought that leaves the reader thinking — no CTA, no sell, no 'DM me'\n"
+            f"- HARD LENGTH RULE: 80-90 words. Spoken video script — 25-30 sec at natural pace.\n"
             f"- Output ONLY the post text, ready to copy-paste"
         )
 
@@ -662,9 +665,10 @@ ONBOARDING_MSG = """\
 Welcome to Founder Voice! Here's how this works 👇
 
 Every morning at 7AM, you'll get:
-• 3 viral topics trending in India right now
-• 5 news stories from your niche
-• 2 content ideas based on your business
+• 2 viral topics trending in India right now
+• 2 news stories from your niche
+• 1 content idea based on your business
+• A button to write your own script anytime
 
 To create a LinkedIn post:
 1️⃣ Reply with a number (like "3") to pick a topic
@@ -925,6 +929,49 @@ async def handle_founder_idea(update: Update, uid: int, idea_text: str) -> bool:
     return True
 
 
+async def handle_custom_script(update: Update, uid: int, text: str) -> bool:
+    if not custom_script_pending.get(uid):
+        return False
+    custom_script_pending.pop(uid, None)
+
+    await update.message.reply_text("Writing your post...")
+    await update.message.reply_chat_action("typing")
+
+    try:
+        post_text, profile = await generate_post(
+            uid=uid,
+            news_topic=text,
+            founder_idea=text,
+            is_business_idea=True,
+        )
+    except Exception as e:
+        print(f"[CustomScript] Failed: {e}")
+        await update.message.reply_text(f"Generation failed: {str(e)[:100]}\nTry again.")
+        return True
+
+    draft = {
+        "founder_name":     profile.get("name", ""),
+        "page_id":          profile.get("page_id"),
+        "news_topic":       text[:120],
+        "founder_idea":     text,
+        "current_draft":    post_text,
+        "is_business_idea": True,
+        "version":          1,
+    }
+    await save_draft(uid, draft)
+
+    await _send_with_retry(
+        update.message.reply_text,
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"YOUR LINKEDIN POST  v1\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{post_text}",
+        reply_markup=draft_keyboard(version=1),
+        label="custom_script post",
+    )
+    return True
+
+
 def _is_off_topic(text: str) -> bool:
     """Return True if text looks like a general-purpose LLM query, not a post-edit instruction.
     Scoped to the first 30 chars so phrases like 'explain my angle more' (legit edit)
@@ -1090,6 +1137,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "That's an older version — scroll down to the latest draft and use those buttons."
             )
             return
+
+    if action == "CUSTOM_SCRIPT":
+        custom_script_pending[uid] = True
+        await query.message.reply_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✍️ YOUR SCRIPT\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "What would you like to write about today?\n\n"
+            "Type your topic, your angle, or paste a rough draft.\n"
+            "I'll turn it into a polished LinkedIn post in your voice.\n\n"
+            "You can also send a voice note."
+        )
+        return
 
     if action == "EDIT":
         edit_pending[uid] = True
@@ -1275,6 +1335,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     sessions.pop(uid, None)
     news_selections.pop(uid, None)
+    custom_script_pending.pop(uid, None)
     await delete_draft(uid)
     await update.message.reply_text("All cleared. Send /start to begin your profile interview.")
 
@@ -1315,6 +1376,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def route_message(update: Update, uid: int, text: str):
+    if await handle_custom_script(update, uid, text):
+        return
     if await handle_draft_reply(update, uid, text):
         return
     if await handle_founder_idea(update, uid, text):
