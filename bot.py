@@ -529,6 +529,12 @@ def _build_persona_system_prompt(profile: dict) -> str:
     top_dims = sorted(dims.items(), key=lambda x: x[1], reverse=True)[:3]
     dims_str = ", ".join(f"{k.replace('_', ' ')} ({v}/100)" for k, v in top_dims)
 
+    profile_text = profile.get("profile_text", "")
+    voice_context = (
+        f"\n\nFOUNDER VOICE CONTEXT — how they actually think and speak:\n{profile_text[:800]}"
+        if profile_text else ""
+    )
+
     example_block = ""
     if examples:
         formatted = "\n\n---\n".join(f'"{p}"' for p in examples[:3])
@@ -547,7 +553,8 @@ def _build_persona_system_prompt(profile: dict) -> str:
         f"This post must feel like a founder thinking out loud: a lesson learned, an insight earned, "
         f"a perspective only they could have. Not a pitch. Not a promo. Pure knowledge-sharing.\n\n"
         f"Write for the ear — short sentences, natural spoken rhythm, no emojis, no hashtags.\n"
-        f"A reader who knows {name} must immediately recognise this as their voice.{example_block}"
+        f"A reader who knows {name} must immediately recognise this as their voice."
+        f"{voice_context}{example_block}"
     )
 
 
@@ -559,9 +566,14 @@ async def generate_post(
     edit_instruction: str = "",
     is_business_idea: bool = False,
 ) -> tuple[str, dict]:
-    profile = await get_founder_profile_from_supabase(uid)
-    name    = profile["name"]
-    tov_ins = _build_tov_instruction(profile["tov_json"])
+    profile      = await get_founder_profile_from_supabase(uid)
+    name         = profile["name"]
+    tov_ins      = _build_tov_instruction(profile["tov_json"])
+    profile_text = profile.get("profile_text", "")
+    voice_anchor = (
+        f"\nFOUNDER'S OWN WORDS (anchor your voice to this):\n{profile_text[:400]}\n"
+        if profile_text else ""
+    )
     system_prompt = _build_persona_system_prompt(profile)
 
     if not profile["profile_text"]:
@@ -583,6 +595,7 @@ async def generate_post(
         prompt = (
             f"Rewrite the LinkedIn post below IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
+            f"{voice_anchor}"
             f"TOPIC: {news_topic}\n"
             f"THEIR IDEA: {founder_idea}\n\n"
             f"CURRENT DRAFT:\n{existing_draft}\n\n"
@@ -595,6 +608,7 @@ async def generate_post(
         prompt = (
             f"Write a LinkedIn post IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
+            f"{voice_anchor}"
             f"CONTENT IDEA: {news_topic}\n\n"
             f"FOUNDER'S ANGLE:\n\"{founder_idea}\"\n\n"
             f"Write a post that:\n"
@@ -613,6 +627,7 @@ async def generate_post(
         prompt = (
             f"Write a LinkedIn post IN {name.upper()}'S VOICE.\n\n"
             f"TONE OF VOICE RULES:\n{tov_ins}\n"
+            f"{voice_anchor}"
             f"TODAY'S NEWS HOOK: {news_topic}\n\n"
             f"FOUNDER'S IDEA / ANGLE:\n\"{founder_idea}\"\n\n"
             f"Write a post that:\n"
@@ -645,6 +660,7 @@ RULES:
 - Adapt each question based on their previous answer.
 - Be warm and conversational.
 - Naturally gather: what their company does, who they serve, what their unique angle is.
+- Pay close attention to HOW they speak: sentence length, vocabulary, whether they use lists or stories, how they open ideas, how they close them.
 - Ask questions until you have enough information for a complete founder profile. Do NOT stop early.
 - You may ask up to 15 questions maximum. Do NOT exceed 15 founder responses.
 - Output the completion marker as soon as the profile is complete, even if fewer than 15 questions were asked.
@@ -653,9 +669,11 @@ RULES:
 After profile is complete (or at 15 responses max), output EXACTLY this on its own line:
 ===INTERVIEW_COMPLETE===
 Then on the next line output ONLY this JSON (no backticks, no markdown):
-{"dimensions":{"philosophical":0,"hustle":0,"data_driven":0,"storytelling":0,"mission":0,"social_empathy":0},"archetype_blend":{"primary":"Naval Ravikant","primary_weight":0.7,"secondary":"Simon Sinek","secondary_weight":0.3},"tov":{"sentence_length":"short - avg 8 words","vocabulary":"clear and direct","hook_style":"bold statement","cta_style":"soft invitation","topics":["topic1","topic2","topic3"]},"business":{"company_name":"","what_they_do":"one line description","industry":"","target_audience":"","unique_angle":"what makes them different from competition"}}
+{"dimensions":{"philosophical":0,"hustle":0,"data_driven":0,"storytelling":0,"mission":0,"social_empathy":0},"archetype_blend":{"primary":"Naval Ravikant","primary_weight":0.7,"secondary":"Simon Sinek","secondary_weight":0.3},"tov":{"sentence_length":"short - avg 8 words","vocabulary":"clear and direct","hook_style":"bold statement","cta_style":"soft invitation","topics":["topic1","topic2","topic3"],"avg_sentence_words":8,"uses_bullet_points":false,"power_words":["word1","word2","word3"],"what_they_never_do":["thing1","thing2"],"vocabulary_level":"conversational","opening_moves":"starts with a specific fact or moment, never a generic question","closing_style":"ends with an open thought or insight, no call to action"},"business":{"company_name":"","what_they_do":"one line description","industry":"","target_audience":"","unique_angle":"what makes them different from competition"}}
 Replace ALL values with real data extracted from the conversation. Dimension scores 0-100.
 Archetypes: Naval Ravikant, Gary Vaynerchuk, Simon Sinek, Brene Brown, Balaji Srinivasan, Oprah Winfrey.
+For power_words: pick 3-5 actual words or short phrases they used in the interview that are distinctive.
+For what_they_never_do: extract 2-3 things that would clearly feel out of character based on their responses.
 """
 
 OPENING = "Hey {name}! I'll ask you a few questions to understand how you think and communicate. No right or wrong answers — just be real. Ready?"
@@ -934,27 +952,15 @@ async def handle_custom_script(update: Update, uid: int, text: str) -> bool:
         return False
     custom_script_pending.pop(uid, None)
 
-    await update.message.reply_text("Writing your post...")
-    await update.message.reply_chat_action("typing")
-
-    try:
-        post_text, profile = await generate_post(
-            uid=uid,
-            news_topic=text,
-            founder_idea=text,
-            is_business_idea=True,
-        )
-    except Exception as e:
-        print(f"[CustomScript] Failed: {e}")
-        await update.message.reply_text(f"Generation failed: {str(e)[:100]}\nTry again.")
-        return True
-
+    # The founder's text IS the script — save it directly, no AI rewrite.
+    # They can tap ✏️ Edit if they want Claude to refine it.
+    profile = await get_founder_profile_from_supabase(uid)
     draft = {
         "founder_name":     profile.get("name", ""),
         "page_id":          profile.get("page_id"),
         "news_topic":       text[:120],
         "founder_idea":     text,
-        "current_draft":    post_text,
+        "current_draft":    text,
         "is_business_idea": True,
         "version":          1,
     }
@@ -963,11 +969,12 @@ async def handle_custom_script(update: Update, uid: int, text: str) -> bool:
     await _send_with_retry(
         update.message.reply_text,
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"YOUR LINKEDIN POST  v1\n"
+        f"YOUR SCRIPT  v1\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{post_text}",
+        f"{text}\n\n"
+        f"Tap ✅ to approve as-is, or ✏️ Edit to polish it in your voice.",
         reply_markup=draft_keyboard(version=1),
-        label="custom_script post",
+        label="custom_script passthrough",
     )
     return True
 
